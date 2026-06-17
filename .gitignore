@@ -1,0 +1,8 @@
+.DS_Store
+Manifest.toml
+LocalPreferences.toml
+*.cov
+*.jl.cov
+*.jl.*.cov
+coverage/
+docs/build/

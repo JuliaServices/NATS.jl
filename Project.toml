@@ -1,0 +1,32 @@
+name = "NATS"
+uuid = "f328b29d-6d55-4807-8dcb-f542605a7cb8"
+version = "0.1.0"
+authors = ["JuliaServices contributors"]
+
+[deps]
+Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+HTTP = "cd3eb016-35fb-5094-929b-558a96fad6f3"
+JSON3 = "0f8b85d8-7281-11e9-16c2-39a750bddbf1"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Reseau = "802f3686-a58f-41ce-bb0c-3c43c75bba36"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
+StructTypes = "856f2bd8-1eba-4b0a-8007-ebc267875bd4"
+URIs = "5c2747f8-b7ea-4ff2-ba2e-563bfd36b1d4"
+libsodium_jll = "a9144af2-ca23-56d9-984f-0d03f7b5ccf8"
+
+[compat]
+HTTP = "2.0 - 2.2"
+JSON3 = "1"
+Reseau = "1"
+StructTypes = "1"
+URIs = "1"
+libsodium_jll = "1"
+julia = "1.10"
+
+[extras]
+Harbor = "af79dbb9-1a80-47ad-8928-192a4af69376"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Harbor", "Test"]
