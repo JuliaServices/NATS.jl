@@ -16,7 +16,7 @@ URIs = "5c2747f8-b7ea-4ff2-ba2e-563bfd36b1d4"
 libsodium_jll = "a9144af2-ca23-56d9-984f-0d03f7b5ccf8"
 
 [compat]
-HTTP = "2.0 - 2.2"
+HTTP = "2.0 - 2.2, 2.3.1"
 JSON3 = "1"
 Reseau = "1"
 StructTypes = "1"
