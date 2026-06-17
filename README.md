@@ -10,6 +10,345 @@ This package is intentionally built around:
 - Harbor-managed NATS server containers for integration tests.
 - A minimal export surface: call APIs through the `NATS` namespace.
 
+## Common Flows
+
+The public API is intentionally namespaced. Start with `using NATS`, then call
+the client through `NATS.*` and JetStream through `NATS.JetStream.*`.
+
+### Connect, Publish, Subscribe
+
+```julia
+using NATS
+
+conn = NATS.connect("nats://localhost:4222"; name = "orders-api")
+
+sub = NATS.subscribe(conn, "orders.created")
+NATS.publish(conn, "orders.created", "order-123")
+
+msg = NATS.next_msg(sub; timeout = 1)
+@info "received order event" subject = msg.subject payload = NATS.payload(msg)
+
+NATS.unsubscribe(sub)
+NATS.drain(conn)
+```
+
+### Callback Subscriptions
+
+```julia
+using NATS
+
+conn = NATS.connect("nats://localhost:4222")
+
+sub = NATS.subscribe(conn, "orders.created") do msg
+    @info "created" payload = NATS.payload(msg)
+end
+
+NATS.publish(conn, "orders.created", "order-123")
+NATS.flush(conn)
+
+NATS.drain(sub; timeout = 2)
+NATS.drain(conn)
+```
+
+### Queue Groups
+
+```julia
+using NATS
+
+conn = NATS.connect("nats://localhost:4222")
+
+worker = NATS.subscribe(conn, "orders.process"; queue = "order-workers") do msg
+    @info "processing order" payload = NATS.payload(msg)
+end
+
+NATS.publish(conn, "orders.process", "order-123")
+NATS.drain(worker)
+NATS.close(conn)
+```
+
+### Request/Reply
+
+```julia
+using NATS
+
+conn = NATS.connect("nats://localhost:4222")
+
+responder = NATS.subscribe(conn, "orders.lookup") do req
+    order_id = NATS.payload(req)
+    NATS.respond(conn, req, "status=paid;id=$order_id")
+end
+
+reply = NATS.request(conn, "orders.lookup", "order-123"; timeout = 2)
+@info "lookup result" payload = NATS.payload(reply)
+
+NATS.unsubscribe(responder)
+NATS.drain(conn)
+```
+
+### Headers And Message Values
+
+```julia
+using NATS
+
+conn = NATS.connect("nats://localhost:4222")
+
+body = """{"id":"order-123"}"""
+msg = NATS.new_msg("orders.created", body;
+    headers = [
+        "Content-Type" => "application/json",
+        "Nats-Msg-Id" => "order-123-created",
+    ],
+)
+
+NATS.publish_msg(conn, msg)
+
+sub = NATS.subscribe(conn, "orders.created")
+received = NATS.next_msg(sub; timeout = 1)
+
+@info "event" content_type = NATS.header(received, "Content-Type") body = NATS.payload(received)
+```
+
+### TLS, WebSockets, And Auth
+
+```julia
+using NATS
+
+tls = NATS.TLSOptions(
+    ca_file = "ca.pem",
+    cert_file = "client-cert.pem",
+    key_file = "client-key.pem",
+)
+
+conn = NATS.connect("tls://nats.internal:4222"; tls)
+ws = NATS.connect(
+    "wss://nats.example.com:443";
+    tls,
+    proxy_path = "/nats",
+    websocket_headers_cb = () -> [
+        "Authorization" => "Bearer $(readchomp("token.txt"))",
+    ],
+)
+
+user_conn = NATS.connect("nats://localhost:4222"; user = "worker", password = "secret")
+token_conn = NATS.connect("nats://localhost:4222"; token_cb = () -> readchomp("nats.token"))
+nkey_conn = NATS.connect("nats://localhost:4222"; nkey_seed = readchomp("user.nk"))
+creds_conn = NATS.connect("nats://localhost:4222"; credentials = "user.creds")
+```
+
+### Reconnects And Observability
+
+```julia
+using NATS
+
+conn = NATS.connect(
+    "nats://nats-a:4222";
+    servers = ["nats://nats-b:4222", "nats://nats-c:4222"],
+    retry_on_failed_connect = true,
+    reconnect_wait = 0.5,
+    reconnect_jitter = 0.1,
+    reconnect_buffer_size = 8 * 1024 * 1024,
+    connected_cb = conn -> @info "connected" url = NATS.connected_url(conn),
+    disconnected_cb = (conn, err) -> @warn "disconnected" err,
+    reconnected_cb = conn -> @info "reconnected" url = NATS.connected_url(conn),
+    error_cb = (conn, sub, err) -> @warn "async NATS error" subject = (sub === nothing ? nothing : sub.subject) err,
+)
+
+@info "NATS stats" stats = NATS.stats(conn) rtt = NATS.rtt(conn; timeout = 2)
+
+status_updates = NATS.status_changed(conn, NATS.RECONNECTING, NATS.CONNECTED, NATS.CLOSED)
+NATS.force_reconnect(conn; timeout = 2)
+@info "next connection status" status = take!(status_updates)
+NATS.remove_status_listener!(conn, status_updates)
+```
+
+### JetStream Streams And Publishing
+
+```julia
+using NATS
+using NATS.JetStream
+
+conn = NATS.connect("nats://localhost:4222")
+
+JetStream.create_or_update_stream(conn, JetStream.StreamConfig(
+    name = "ORDERS",
+    subjects = ["orders.*"],
+    storage = "file",
+    duplicate_window = 120_000_000_000,
+))
+
+ack = JetStream.publish(conn, "orders.created", """{"id":"order-123"}""";
+    msg_id = "order-123-created",
+    expected_stream = "ORDERS",
+)
+
+future = JetStream.publish_async(conn, "orders.created", """{"id":"order-124"}""";
+    msg_id = "order-124-created",
+    max_pending = 256,
+    error_cb = (conn, msg, err) -> @warn "publish failed" subject = msg.subject err,
+)
+
+async_ack = JetStream.wait_ack(future; timeout = 2)
+@info "stored messages" sync_seq = ack.seq async_seq = async_ack.seq
+```
+
+### JetStream Pull Consumers
+
+```julia
+using NATS
+using NATS.JetStream
+
+conn = NATS.connect("nats://localhost:4222")
+
+JetStream.create_or_update_stream(conn, JetStream.StreamConfig(
+    name = "ORDERS",
+    subjects = ["orders.*"],
+    storage = "file",
+))
+
+JetStream.create_or_update_consumer(conn, "ORDERS", JetStream.ConsumerConfig(
+    durable_name = "billing",
+    ack_policy = "explicit",
+    filter_subject = "orders.created",
+))
+
+pull = JetStream.pull_subscribe(conn, "ORDERS", "billing")
+try
+    for msg in JetStream.fetch(pull; batch = 10, expires_ns = 2_000_000_000)
+        @info "billing event" payload = NATS.payload(msg) meta = JetStream.metadata(msg)
+        JetStream.ack(conn, msg)
+    end
+finally
+    close(pull)
+end
+```
+
+### JetStream Push And Ordered Consumers
+
+```julia
+using NATS
+using NATS.JetStream
+
+conn = NATS.connect("nats://localhost:4222")
+
+push = JetStream.push_subscribe(conn, "ORDERS", JetStream.ConsumerConfig(
+    durable_name = "notifications",
+    filter_subject = "orders.created",
+    ack_policy = "explicit",
+    idle_heartbeat = 1_000_000_000,
+))
+
+ctx = JetStream.consume(push; channel_size = 128)
+try
+    msg = JetStream.next_msg(ctx; timeout = 2)
+    JetStream.ack(conn, msg)
+finally
+    close(ctx)
+end
+
+ordered = JetStream.ordered_consumer(conn, "ORDERS"; filter_subject = "orders.created")
+try
+    for msg in JetStream.fetch(ordered; batch = 100, no_wait = true)
+        @info "ordered replay" payload = NATS.payload(msg)
+    end
+finally
+    close(ordered)
+end
+```
+
+### Key/Value Buckets
+
+```julia
+using NATS
+using NATS.JetStream
+
+conn = NATS.connect("nats://localhost:4222")
+
+kv = JetStream.create_or_update_key_value(conn, JetStream.KeyValueConfig(
+    bucket = "SETTINGS",
+    storage = "file",
+    history = 5,
+    metadata = Dict("service" => "orders"),
+))
+
+rev = JetStream.put(kv, "feature.checkout-v2", "enabled")
+entry = JetStream.get(kv, "feature.checkout-v2")
+@assert JetStream.value_string(entry) == "enabled"
+
+next_rev = JetStream.update(kv, "feature.checkout-v2", "disabled", rev)
+history = JetStream.history(kv, "feature.checkout-v2")
+keys = JetStream.keys(kv, "feature.*")
+
+watcher = JetStream.watch(kv, "feature.*"; updates_only = true)
+try
+    JetStream.put(kv, "feature.checkout-v2", "enabled")
+    update = JetStream.next_update(watcher; timeout = 2)
+    @info "setting changed" key = update.key revision = update.revision value = JetStream.value_string(update)
+finally
+    close(watcher)
+end
+```
+
+### Object Stores
+
+```julia
+using NATS
+using NATS.JetStream
+
+conn = NATS.connect("nats://localhost:4222")
+
+objects = JetStream.create_or_update_object_store(conn, JetStream.ObjectStoreConfig(
+    bucket = "ARTIFACTS",
+    storage = "file",
+    metadata = Dict("service" => "reports"),
+))
+
+info = JetStream.put(objects, JetStream.ObjectMeta(
+    name = "daily-report.json",
+    description = "Daily order summary",
+    metadata = Dict("content-type" => "application/json"),
+), """{"orders":42}""")
+
+body = JetStream.get_string(objects, "daily-report.json")
+stored = JetStream.get_info(objects, "daily-report.json")
+
+JetStream.put_file(objects, "build/report.pdf"; name = "reports/daily.pdf")
+JetStream.get_file(objects, "reports/daily.pdf", "downloaded-report.pdf")
+
+for object in JetStream.list(objects)
+    @info "object" name = object.name size = object.size
+end
+```
+
+### Services With `NATS.Micro`
+
+```julia
+using NATS
+
+conn = NATS.connect("nats://localhost:4222")
+
+svc = NATS.Micro.add_service(
+    conn;
+    name = "OrderService",
+    version = "0.1.0",
+    description = "Order operations",
+    endpoint = NATS.Micro.EndpointConfig(
+        subject = "orders.lookup",
+        handler = req -> NATS.Micro.respond(req, "order=$(NATS.Micro.payload(req));status=paid"),
+    ),
+)
+
+admin = NATS.Micro.add_group(svc, "orders.admin")
+NATS.Micro.add_endpoint!(admin, "Cancel"; subject = "orders.cancel") do req
+    NATS.Micro.respond(req, "cancelled $(NATS.Micro.payload(req))")
+end
+
+reply = NATS.request(conn, "orders.lookup", "order-123"; timeout = 2)
+stats = NATS.Micro.stats(svc)
+
+NATS.Micro.stop(svc)
+NATS.drain(conn)
+```
+
 ## First Slice
 
 The current implementation includes:
