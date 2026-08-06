@@ -256,6 +256,7 @@ conn = NATS.connect(
     custom_reconnect_delay_cb = attempt -> min(0.25 * attempt, 2.0),
     reconnect_to_server_cb = (servers, _info) -> (first(servers), 0.0),
     reconnect_buffer_size = 8 * 1024 * 1024,
+    write_buffer_size = 32 * 1024,
     reconnect_on_flusher_error = false,
     ignore_auth_error_abort = false,
     ignore_discovered_servers = false,
@@ -271,8 +272,12 @@ conn = NATS.connect(
 
 Set `reconnect_buffer_size = -1` to disable publish buffering during reconnect.
 `NATS.buffered(conn)` returns the bytes currently queued for replay.
-By default, a synchronous write error is reported through `error_cb` and
-`conn.async_errors` but does not force an immediate reconnect. Set
+`write_buffer_size` sets the connected write-coalescing threshold. Its default
+is 32 KiB, as in `nats.go`. Set it to `0` to use synchronous writes.
+By default, a write error is reported through `error_cb` and
+`conn.async_errors` but does not force an immediate reconnect. A threshold
+flush can report the error to the sending call. A background flush reports it
+asynchronously. Set
 `reconnect_on_flusher_error = true` to match `nats.go`'s advanced flusher-error
 policy: write failures start a reconnect when reconnects are allowed, or close
 the connection when `allow_reconnect = false`.

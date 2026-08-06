@@ -147,6 +147,7 @@ conn = NATS.connect(
     reconnect_wait = 0.5,
     reconnect_jitter = 0.1,
     reconnect_buffer_size = 8 * 1024 * 1024,
+    write_buffer_size = 32 * 1024,
     connected_cb = conn -> @info "connected" url = NATS.connected_url_redacted(conn),
     disconnected_cb = (conn, err) -> @warn "disconnected" err,
     reconnected_cb = conn -> @info "reconnected" url = NATS.connected_url_redacted(conn),
@@ -383,8 +384,9 @@ The current implementation includes:
   explicit forced reconnect, TLS-specific reconnect jitter, custom
   reconnect-delay and reconnect-to-server callbacks, and `nats.go`-style
   repeated-auth-error reconnect abort with opt-out.
-- Publish buffering during reconnect with a configurable byte cap, disabled
-  buffering mode, pending-buffer byte inspection, and opt-in
+- A `nats.go`-style bounded write buffer and flusher task that coalesce small
+  protocol frames, plus publish buffering during reconnect with a configurable
+  byte cap, disabled buffering mode, pending-buffer byte inspection, and opt-in
   `nats.go`-style reconnect-on-flusher-error policy for broken writes.
 - Connected, async error, reconnect-error, discovered-server, lame-duck-mode,
   disconnected, reconnected, and closed callbacks, with last-error inspection,

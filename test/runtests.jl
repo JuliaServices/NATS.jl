@@ -34,7 +34,7 @@ $JWT_USER_SEED
     conn = NATS.new_connection(
         server,
         [server],
-        NATS.Options(),
+        NATS.Options(write_buffer_size = 0),
         IOBuffer(),
         NATS.ServerInfo(
             server_id = "sid",
@@ -94,7 +94,7 @@ end
     conn = NATS.new_connection(
         server,
         [server],
-        NATS.Options(),
+        NATS.Options(write_buffer_size = 0),
         io,
         NATS.ServerInfo(headers = true, max_payload = 10),
         NATS.CONNECTED;
@@ -152,7 +152,7 @@ end
     conn = NATS.new_connection(
         server,
         [server],
-        NATS.Options(),
+        NATS.Options(write_buffer_size = 0),
         io,
         NATS.ServerInfo(headers = true, max_payload = 1024),
         NATS.CONNECTED;
@@ -705,6 +705,44 @@ Base.write(::ThrowingFlushIO, data::AbstractVector{UInt8}) = length(data)
 Base.flush(io::ThrowingFlushIO) = throw(io.err)
 Base.close(io::ThrowingFlushIO) = (io.closed = true; nothing)
 
+mutable struct CountingWriteIO
+    writes::Vector{Vector{UInt8}}
+    closed::Bool
+end
+
+Base.write(io::CountingWriteIO, data::AbstractVector{UInt8}) = (push!(io.writes, copy(data)); length(data))
+Base.flush(::CountingWriteIO) = nothing
+Base.close(io::CountingWriteIO) = (io.closed = true; nothing)
+
+@testset "write buffer coalescing" begin
+    server = NATS.parse_server_url("nats://buffer.example:4222")
+    io = CountingWriteIO(Vector{UInt8}[], false)
+    conn = NATS.new_connection(
+        server,
+        [server],
+        NATS.Options(allow_reconnect = false, write_buffer_size = 1024 * 1024),
+        io,
+        NATS.ServerInfo(headers = true, max_payload = 1024),
+        NATS.CONNECTED;
+        connected_once = true,
+    )
+    frame = NATS.pub_frame("natsjl.buffer", "data")
+    try
+        for _ in 1:100
+            NATS.publish(conn, "natsjl.buffer", "data")
+        end
+        NATS.flush_write_buffer!(conn)
+        @test length(io.writes) == 1
+        @test only(io.writes) == repeat(frame, 100)
+        @test NATS.stats(conn).out_msgs == 100
+    finally
+        NATS.close(conn)
+    end
+    @test io.closed
+    @test conn.flusher_task !== nothing
+    @test timedwait(() -> istaskdone(conn.flusher_task), 0.5; pollint = 0.001) == :ok
+end
+
 mutable struct FailingReadIO <: IO
     payload::Vector{UInt8}
     position::Int
@@ -730,6 +768,7 @@ function write_error_connection(url::AbstractString; kwargs...)
         max_reconnect = 5,
         connect_timeout = 0.2,
         request_timeout = 1.0,
+        write_buffer_size = 1,
         kwargs...,
     ))
     io = ThrowingWriteIO(ErrorException("injected write failure"), false)
@@ -749,6 +788,7 @@ function flush_error_connection(url::AbstractString; kwargs...)
     server = NATS.parse_server_url(url)
     options = NATS.validate_options(NATS.Options(;
         request_timeout = 1.0,
+        write_buffer_size = 1,
         kwargs...,
     ))
     io = ThrowingFlushIO(ErrorException("injected flush failure"), false)
@@ -1588,6 +1628,7 @@ end
     @test_throws ArgumentError NATS.validate_options(NATS.Options(reconnect_jitter = -0.1))
     @test_throws ArgumentError NATS.validate_options(NATS.Options(reconnect_jitter_tls = -0.1))
     @test_throws ArgumentError NATS.validate_options(NATS.Options(reconnect_buffer_size = -2))
+    @test_throws ArgumentError NATS.validate_options(NATS.Options(write_buffer_size = -1))
     @test_throws ArgumentError NATS.validate_options(NATS.Options(ping_interval = -0.1))
     for bad_prefix in ["\$BOB.", "\$BOB.*", "\$BOB.>", ">", ".", "", "BOB.*.X", "BOB.>.X", ".BOB", "BOB..X", "BOB X"]
         @test_throws ArgumentError NATS.validate_options(NATS.Options(inbox_prefix = bad_prefix))
@@ -1599,6 +1640,22 @@ end
         1,
         MersenneTwister(5),
     )
+
+    delay_conn = NATS.new_connection(
+        nats_url,
+        [nats_url],
+        NATS.Options(),
+        IOBuffer(),
+        NATS.ServerInfo(headers = true),
+        NATS.RECONNECTING;
+        connected_once = true,
+    )
+    delay_task = @async NATS.wait_reconnect_delay(delay_conn, 60.0)
+    @test timedwait(() -> delay_conn.reconnect_timer !== nothing, 1; pollint = 0.001) == :ok
+    elapsed = @elapsed NATS.close(delay_conn)
+    @test elapsed < 0.5
+    @test timedwait(() -> istaskdone(delay_task), 0.5; pollint = 0.001) == :ok
+    @test fetch(delay_task) === false
 end
 
 with_flush_hang_mock() do url, events, ready
@@ -3912,6 +3969,26 @@ with_nats() do url
                     timeout = 2,
                 )
                 @test isempty(empty_with_heartbeat)
+
+                @test_throws NATS.ConnectionTimeoutError JetStream.fetch(
+                    pull;
+                    batch = 1,
+                    expires_ns = 250_000_000,
+                    timeout = 0.03,
+                )
+                delayed_publish = @async begin
+                    sleep(0.35)
+                    JetStream.publish(conn, "$stream.pullsub", "after-timeout"; timeout = 2)
+                end
+                isolated = JetStream.fetch(
+                    pull;
+                    batch = 1,
+                    expires_ns = 800_000_000,
+                    timeout = 1,
+                )
+                wait(delayed_publish)
+                @test NATS.payload.(isolated) == ["after-timeout"]
+                JetStream.ack(conn, only(isolated))
             finally
                 close(pull)
             end
@@ -6168,6 +6245,21 @@ with_nats_container() do _container, url, port
             @test !default_io.closed
         finally
             NATS.close(default_error_conn)
+        end
+
+        background_error_conn, background_error_io = write_error_connection(
+            url;
+            write_buffer_size = NATS.DEFAULT_WRITE_BUFFER_SIZE,
+        )
+        try
+            @test NATS.publish(background_error_conn, "natsjl.write-error.background", "data") === nothing
+            @test wait_ready(background_error_conn.async_errors) === background_error_io.err
+            @test NATS.last_error(background_error_conn) === background_error_io.err
+            @test NATS.stats(background_error_conn).out_msgs == 1
+            @test NATS.connection_status(background_error_conn) == NATS.CONNECTED
+            @test !background_error_io.closed
+        finally
+            NATS.close(background_error_conn)
         end
 
         closed = Channel{Any}(1)

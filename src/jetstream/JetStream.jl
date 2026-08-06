@@ -2835,13 +2835,19 @@ function fetch(
     try
         ensure_pull_subscription_open_locked(psub)
         check_pull_subscription_limits(psub, batch, expires_ns, no_wait, max_bytes)
-        NATS.publish(
-            psub.connection,
-            pull_request_subject(psub.stream, psub.consumer; api_prefix = psub.api_prefix),
-            next_request_body(; batch, expires_ns, no_wait, max_bytes, min_pending, min_ack_pending, priority_group, priority, heartbeat_ns);
-            reply = psub.inbox,
+        return fetch_pull_request(
+            psub,
+            batch,
+            expires_ns,
+            no_wait,
+            timeout,
+            max_bytes,
+            min_pending,
+            min_ack_pending,
+            priority_group,
+            priority,
+            heartbeat_ns,
         )
-        return collect_pull_messages(psub.subscription, batch, timeout; heartbeat_ns)
     finally
         unlock(psub.lock)
     end
@@ -2895,15 +2901,57 @@ function fetch_with_terminal(
     try
         ensure_pull_subscription_open_locked(psub)
         check_pull_subscription_limits(psub, batch, expires_ns, no_wait, max_bytes)
+        return fetch_pull_request(
+            psub,
+            batch,
+            expires_ns,
+            no_wait,
+            timeout,
+            max_bytes,
+            min_pending,
+            min_ack_pending,
+            priority_group,
+            priority,
+            heartbeat_ns;
+            return_terminal = true,
+        )
+    finally
+        unlock(psub.lock)
+    end
+end
+
+function fetch_pull_request(
+    psub::PullSubscription,
+    batch::Integer,
+    expires_ns::Integer,
+    no_wait::Bool,
+    timeout::Real,
+    max_bytes::Union{Nothing, Integer},
+    min_pending::Union{Nothing, Integer},
+    min_ack_pending::Union{Nothing, Integer},
+    priority_group::Union{Nothing, AbstractString},
+    priority::Union{Nothing, Integer},
+    heartbeat_ns::Union{Nothing, Integer};
+    return_terminal::Bool = false,
+)
+    inbox = NATS.new_inbox(psub.connection)
+    sub = NATS.subscribe(psub.connection, inbox; channel_size = max(2 * Int(batch), 1))
+    try
         NATS.publish(
             psub.connection,
             pull_request_subject(psub.stream, psub.consumer; api_prefix = psub.api_prefix),
             next_request_body(; batch, expires_ns, no_wait, max_bytes, min_pending, min_ack_pending, priority_group, priority, heartbeat_ns);
-            reply = psub.inbox,
+            reply = inbox,
         )
-        return collect_pull_messages(psub.subscription, batch, timeout; return_terminal = true, heartbeat_ns)
+        return collect_pull_messages(sub, batch, timeout; return_terminal, heartbeat_ns)
     finally
-        unlock(psub.lock)
+        if !sub.closed
+            try
+                NATS.unsubscribe(psub.connection, sub)
+            catch
+                NATS.close_subscription_local!(psub.connection, sub)
+            end
+        end
     end
 end
 

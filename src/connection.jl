@@ -6,6 +6,7 @@ const CONNECTION_STATUS_CHANNEL_SIZE = 64
 const SUBSCRIPTION_STATUS_CHANNEL_SIZE = 16
 const DEFAULT_PING_INTERVAL = 120.0
 const DEFAULT_MAX_PINGS_OUT = 2
+const DEFAULT_WRITE_BUFFER_SIZE = 32 * 1024
 
 Base.@kwdef mutable struct Options
     servers::Vector{String} = String[]
@@ -45,6 +46,7 @@ Base.@kwdef mutable struct Options
     custom_reconnect_delay_cb::Union{Nothing, Function} = nothing
     reconnect_to_server_cb::Union{Nothing, Function} = nothing
     reconnect_buffer_size::Int = 8 * 1024 * 1024
+    write_buffer_size::Int = DEFAULT_WRITE_BUFFER_SIZE
     reconnect_on_flusher_error::Bool = false
     ignore_auth_error_abort::Bool = false
     retry_on_failed_connect::Bool = false
@@ -127,6 +129,9 @@ mutable struct Connection
     lock::ReentrantLock
     write_lock::ReentrantLock
     flush_lock::ReentrantLock
+    write_buffer::Vector{UInt8}
+    flusher_signal::Channel{Nothing}
+    flusher_task::Union{Nothing, Task}
     subscriptions::Dict{Int, Subscription}
     next_sid::Int
     rng::AbstractRNG
@@ -134,6 +139,7 @@ mutable struct Connection
     reconnect_task::Union{Nothing, Task}
     ping_task::Union{Nothing, Task}
     ping_timer::Union{Nothing, Timer}
+    reconnect_timer::Union{Nothing, Timer}
     pongs::Channel{Nothing}
     pings_out::Int
     async_errors::Channel{Any}
@@ -430,6 +436,7 @@ function validate_options(options::Options)
     options.reconnect_jitter < 0 && throw(ArgumentError("reconnect_jitter must be nonnegative"))
     options.reconnect_jitter_tls < 0 && throw(ArgumentError("reconnect_jitter_tls must be nonnegative"))
     options.reconnect_buffer_size < -1 && throw(ArgumentError("reconnect_buffer_size must be -1 or nonnegative"))
+    options.write_buffer_size < 0 && throw(ArgumentError("write_buffer_size must be nonnegative"))
     options.ping_interval < 0 && throw(ArgumentError("ping_interval must be nonnegative"))
     validate_inbox_prefix(options.inbox_prefix)
     return options
@@ -624,9 +631,15 @@ end
 function set_connection_status_locked!(conn::Connection, status::ConnectionStatus)
     conn.status == status && return nothing
     conn.status = status
-    if status == CLOSED && conn.ping_timer !== nothing
-        close(conn.ping_timer::Timer)
-        conn.ping_timer = nothing
+    if status == CLOSED
+        if conn.ping_timer !== nothing
+            close(conn.ping_timer::Timer)
+            conn.ping_timer = nothing
+        end
+        if conn.reconnect_timer !== nothing
+            close(conn.reconnect_timer::Timer)
+            conn.reconnect_timer = nothing
+        end
     end
     send_connection_status_locked!(conn, status)
     return nothing
@@ -896,16 +909,109 @@ function write_frame(io, frame::Vector{UInt8})
     return nothing
 end
 
+function take_write_buffer_locked!(conn::Connection)
+    data = conn.write_buffer
+    conn.write_buffer = UInt8[]
+    return data
+end
+
+function flush_write_buffer_locked!(conn::Connection)
+    isempty(conn.write_buffer) && return nothing
+    data = take_write_buffer_locked!(conn)
+    write_frame(conn.io, data)
+    return nothing
+end
+
+function handle_background_write_error!(conn::Connection, err)
+    if connection_status(conn) == CONNECTED
+        if conn.options.reconnect_on_flusher_error
+            if conn.options.allow_reconnect
+                start_reconnect!(conn, err)
+            else
+                close_after_write_error!(conn, err)
+            end
+        else
+            notify_error!(conn, err)
+        end
+    end
+    return nothing
+end
+
+function flusher_loop(conn::Connection)
+    while true
+        try
+            take!(conn.flusher_signal)
+        catch err
+            err isa InvalidStateException || rethrow()
+            return nothing
+        end
+        status = connection_status(conn)
+        status == CLOSED && return nothing
+        local write_error = nothing
+        lock(conn.write_lock)
+        try
+            status = connection_status(conn)
+            if status == CONNECTED || status == DRAINING
+                flush_write_buffer_locked!(conn)
+            end
+        catch err
+            write_error = err
+        finally
+            unlock(conn.write_lock)
+        end
+        write_error === nothing || handle_background_write_error!(conn, write_error)
+    end
+end
+
+function kick_flusher_locked!(conn::Connection)
+    if conn.flusher_task === nothing || istaskdone(conn.flusher_task::Task)
+        conn.flusher_task = errormonitor(@async flusher_loop(conn))
+    end
+    isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
+    return nothing
+end
+
+function queue_frame_locked!(conn::Connection, frame::Vector{UInt8})
+    if conn.options.write_buffer_size == 0
+        write_frame(conn.io, frame)
+        return nothing
+    end
+    append!(conn.write_buffer, frame)
+    if length(conn.write_buffer) >= conn.options.write_buffer_size
+        flush_write_buffer_locked!(conn)
+    else
+        kick_flusher_locked!(conn)
+    end
+    return nothing
+end
+
+function flush_write_buffer!(conn::Connection)
+    lock(conn.write_lock)
+    try
+        flush_write_buffer_locked!(conn)
+    finally
+        unlock(conn.write_lock)
+    end
+    return nothing
+end
+
 function close_after_terminal_error!(conn::Connection, err)
     notify_error!(conn, err)
-    lock(conn.lock)
+    lock(conn.write_lock)
     try
-        set_connection_status_locked!(conn, CLOSED)
-        empty!(conn.pending_frames)
-        conn.pending_bytes = 0
+        lock(conn.lock)
+        try
+            set_connection_status_locked!(conn, CLOSED)
+            empty!(conn.write_buffer)
+            empty!(conn.pending_frames)
+            conn.pending_bytes = 0
+        finally
+            unlock(conn.lock)
+        end
     finally
-        unlock(conn.lock)
+        unlock(conn.write_lock)
     end
+    isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
     close_subscriptions!(conn; err)
     try close(conn.io) catch end
     notify_closed!(conn)
@@ -926,7 +1032,7 @@ function send_frame(conn::Connection, frame::Vector{UInt8}; timeout::Union{Nothi
             status = connection_status(conn)
             (status == CONNECTED || (allow_draining && status == DRAINING)) ||
                 throw(ConnectionClosedError("cannot write while connection is not connected"))
-            write_frame(conn.io, frame)
+            queue_frame_locked!(conn, frame)
             return nothing
         catch err
             write_error = err
@@ -1203,9 +1309,13 @@ function new_connection(
         ReentrantLock(),
         ReentrantLock(),
         ReentrantLock(),
+        UInt8[],
+        Channel{Nothing}(1),
+        nothing,
         Dict{Int, Subscription}(),
         0,
         Random.default_rng(),
+        nothing,
         nothing,
         nothing,
         nothing,
@@ -1364,27 +1474,38 @@ function close(conn::Connection)
     should_notify = false
     subs = Subscription[]
     cleanups = Function[]
+    buffered = UInt8[]
     err = ConnectionClosedError("connection is closed")
-    lock(conn.lock)
+    lock(conn.write_lock)
     try
-        conn.status == CLOSED && return nothing
-        set_connection_status_locked!(conn, CLOSED)
-        should_notify = !conn.options.no_callbacks_after_client_close
-        subs = collect(values(conn.subscriptions))
-        empty!(conn.subscriptions)
-        empty!(conn.pending_frames)
-        conn.pending_bytes = 0
-        cleanups = take_all_subscription_cleanups_locked!(conn)
-        abort_pub_ack_futures_locked!(conn, err)
-        for ch in values(conn.request_map)
-            close(ch)
+        lock(conn.lock)
+        try
+            conn.status == CLOSED && return nothing
+            flush_on_close = conn.status == CONNECTED || conn.status == DRAINING
+            set_connection_status_locked!(conn, CLOSED)
+            should_notify = !conn.options.no_callbacks_after_client_close
+            subs = collect(values(conn.subscriptions))
+            empty!(conn.subscriptions)
+            buffered = flush_on_close ? take_write_buffer_locked!(conn) : UInt8[]
+            empty!(conn.write_buffer)
+            empty!(conn.pending_frames)
+            conn.pending_bytes = 0
+            cleanups = take_all_subscription_cleanups_locked!(conn)
+            abort_pub_ack_futures_locked!(conn, err)
+            for ch in values(conn.request_map)
+                close(ch)
+            end
+            empty!(conn.request_map)
+            conn.request_sub = nothing
+            conn.request_prefix = nothing
+        finally
+            unlock(conn.lock)
         end
-        empty!(conn.request_map)
-        conn.request_sub = nothing
-        conn.request_prefix = nothing
+        isempty(buffered) || try write_frame(conn.io, buffered) catch end
     finally
-        unlock(conn.lock)
+        unlock(conn.write_lock)
     end
+    isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
     for sub in subs
         close_subscription_local!(conn, sub; err)
     end
@@ -1431,17 +1552,7 @@ function reader_loop(conn::Connection)
         if conn.options.allow_reconnect && conn.status != DRAINING
             start_reconnect!(conn, err)
         else
-            notify_error!(conn, err)
-            lock(conn.lock)
-            try
-                set_connection_status_locked!(conn, CLOSED)
-                empty!(conn.pending_frames)
-                conn.pending_bytes = 0
-            finally
-                unlock(conn.lock)
-            end
-            close_subscriptions!(conn; err)
-            notify_closed!(conn)
+            close_after_terminal_error!(conn, err)
         end
     end
     return nothing
@@ -1451,30 +1562,43 @@ function force_reconnect(conn::Connection; timeout::Union{Nothing, Real} = conn.
     status = connection_status(conn)
     status == CLOSED && throw(ConnectionClosedError("connection is closed"))
     status == DRAINING && throw(ConnectionDrainingError())
-    status == RECONNECTING || start_reconnect!(conn, ErrorException("force reconnect requested"))
+    if status != RECONNECTING
+        try
+            flush_write_buffer!(conn)
+        catch err
+            start_reconnect!(conn, err)
+        end
+        start_reconnect!(conn, ErrorException("force reconnect requested"))
+    end
     wait_connected(conn; timeout, operation = "force_reconnect")
     return nothing
 end
 
 function start_reconnect!(conn::Connection, err)
     should_start = false
-    lock(conn.lock)
+    lock(conn.write_lock)
     try
-        if conn.status == CONNECTED || conn.status == CONNECTING
-            set_connection_status_locked!(conn, RECONNECTING)
-            for sub in values(conn.subscriptions)
-                lock(sub.lock)
-                try
-                    sub.server_sent = false
-                finally
-                    unlock(sub.lock)
+        lock(conn.lock)
+        try
+            if conn.status == CONNECTED || conn.status == CONNECTING
+                set_connection_status_locked!(conn, RECONNECTING)
+                empty!(conn.write_buffer)
+                for sub in values(conn.subscriptions)
+                    lock(sub.lock)
+                    try
+                        sub.server_sent = false
+                    finally
+                        unlock(sub.lock)
+                    end
                 end
+                abort_pub_ack_futures_locked!(conn, ConnectionReconnectingError())
+                should_start = true
             end
-            abort_pub_ack_futures_locked!(conn, ConnectionReconnectingError())
-            should_start = true
+        finally
+            unlock(conn.lock)
         end
     finally
-        unlock(conn.lock)
+        unlock(conn.write_lock)
     end
     should_start || return nothing
     notify_error!(conn, err)
@@ -1731,6 +1855,7 @@ function mark_reconnect_failed!(conn::Connection, attempts::Int, last_error)
     finally
         unlock(conn.lock)
     end
+    isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
     close_subscriptions!(conn; err)
     try close(conn.io) catch end
     notify_closed!(conn)
@@ -1748,6 +1873,7 @@ function abort_reconnect_after_auth_error!(conn::Connection, err)
     finally
         unlock(conn.lock)
     end
+    isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
     close_subscriptions!(conn; err)
     try close(conn.io) catch end
     notify_closed!(conn)
@@ -1811,6 +1937,35 @@ function record_reconnect_error!(conn::Connection, err)
     return nothing
 end
 
+function wait_reconnect_delay(conn::Connection, delay::Real)
+    delay <= 0 && (yield(); return connection_status(conn) != CLOSED)
+    timer = Timer(Float64(delay))
+    lock(conn.lock)
+    try
+        if conn.status == CLOSED
+            close(timer)
+            return false
+        end
+        conn.reconnect_timer = timer
+    finally
+        unlock(conn.lock)
+    end
+    try
+        wait(timer)
+    catch err
+        err isa EOFError || err isa InvalidStateException || rethrow()
+    finally
+        lock(conn.lock)
+        try
+            conn.reconnect_timer === timer && (conn.reconnect_timer = nothing)
+        finally
+            unlock(conn.lock)
+        end
+        try close(timer) catch end
+    end
+    return connection_status(conn) != CLOSED
+end
+
 function reconnect_loop(conn::Connection, initial_error = nothing)
     attempts = 0
     whole_list_attempts = 0
@@ -1829,7 +1984,7 @@ function reconnect_loop(conn::Connection, initial_error = nothing)
                 mark_reconnect_failed!(conn, attempts, last_error)
                 return nothing
             end
-            selected_delay > 0 ? sleep(selected_delay) : yield()
+            wait_reconnect_delay(conn, selected_delay) || return nothing
             attempts += 1
             ok, err = reconnect_attempt!(conn, selected)
             ok && return nothing
@@ -1877,7 +2032,7 @@ function reconnect_loop(conn::Connection, initial_error = nothing)
             notify_reconnect_error!(conn, err)
             conn.options.reconnect_wait
         end
-        sleep(wait)
+        wait_reconnect_delay(conn, wait) || return nothing
     end
 end
 
@@ -2788,6 +2943,25 @@ function check_request_response(msg::Msg, subject::AbstractString)
     return msg
 end
 
+function take_request_reply(ch::Channel{Msg}, timeout::Real)
+    timed_out = Threads.Atomic{Bool}(false)
+    timer = Timer(Float64(timeout)) do _
+        timed_out[] = true
+        try close(ch) catch end
+    end
+    try
+        return take!(ch)
+    catch err
+        if err isa InvalidStateException
+            timed_out[] && throw(ConnectionTimeoutError("request", Float64(timeout)))
+            throw(ConnectionClosedError("request inbox closed"))
+        end
+        rethrow()
+    finally
+        try close(timer) catch end
+    end
+end
+
 function request_exact(conn::Connection, subject::AbstractString, data = nothing; timeout::Real = conn.options.request_timeout, headers::Vector{Pair{String,String}} = Pair{String,String}[])
     subject_s = validate_publish_subject(subject; skip = conn.options.skip_subject_validation)
     ensure_headers_supported(conn, headers)
@@ -2833,10 +3007,7 @@ function request(conn::Connection, subject::AbstractString, data = nothing; time
     end
     try
         publish(conn, subject_s, data; reply = inbox, headers)
-        result = timedwait(() -> isready(ch) || !isopen(ch), timeout; pollint = 0.001)
-        result == :ok || throw(ConnectionTimeoutError("request", Float64(timeout)))
-        isready(ch) || throw(ConnectionClosedError("request inbox closed"))
-        msg = take!(ch)
+        msg = take_request_reply(ch, timeout)
         return check_request_response(msg, subject_s)
     finally
         lock(conn.lock)
