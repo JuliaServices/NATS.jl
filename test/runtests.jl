@@ -696,6 +696,15 @@ Base.write(io::ThrowingWriteIO, ::AbstractVector{UInt8}) = throw(io.err)
 Base.flush(::ThrowingWriteIO) = nothing
 Base.close(io::ThrowingWriteIO) = (io.closed = true; nothing)
 
+mutable struct ThrowingFlushIO
+    err::Any
+    closed::Bool
+end
+
+Base.write(::ThrowingFlushIO, data::AbstractVector{UInt8}) = length(data)
+Base.flush(io::ThrowingFlushIO) = throw(io.err)
+Base.close(io::ThrowingFlushIO) = (io.closed = true; nothing)
+
 mutable struct FailingReadIO <: IO
     payload::Vector{UInt8}
     position::Int
@@ -724,6 +733,25 @@ function write_error_connection(url::AbstractString; kwargs...)
         kwargs...,
     ))
     io = ThrowingWriteIO(ErrorException("injected write failure"), false)
+    conn = NATS.new_connection(
+        server,
+        [server],
+        options,
+        io,
+        NATS.ServerInfo(headers = true, max_payload = 1048576),
+        NATS.CONNECTED;
+        connected_once = true,
+    )
+    return conn, io
+end
+
+function flush_error_connection(url::AbstractString; kwargs...)
+    server = NATS.parse_server_url(url)
+    options = NATS.validate_options(NATS.Options(;
+        request_timeout = 1.0,
+        kwargs...,
+    ))
+    io = ThrowingFlushIO(ErrorException("injected flush failure"), false)
     conn = NATS.new_connection(
         server,
         [server],
@@ -1123,6 +1151,10 @@ end
     @test_throws NATS.InvalidHeaderKeyError NATS.parse_header_block(Vector{UInt8}(codeunits("NATS/1.0\r\nbad key: value\r\n\r\n")))
     malformed_hmsg = IOBuffer(Vector{UInt8}(codeunits("NATS/1.0\r\nk1:v1payload\r\n")))
     @test_throws NATS.ProtocolError NATS.parse_msg_line("HMSG foo 1 15 22", malformed_hmsg, true)
+    @test_throws NATS.ProtocolError NATS.parse_msg_line("MSG foo 1 3 3 extra", IOBuffer(Vector{UInt8}(codeunits("abc\r\n"))), false)
+    @test_throws NATS.ProtocolError NATS.parse_msg_line("MSG foo -1 3", IOBuffer(Vector{UInt8}(codeunits("abc\r\n"))), false)
+    @test_throws NATS.ProtocolError NATS.parse_msg_line("MSG foo 1 nope", IOBuffer(), false)
+    @test_throws NATS.ProtocolError NATS.parse_msg_line("HMSG foo 1 -1 0", IOBuffer(), true)
     @test String(NATS.sub_frame("foo", nothing, 7)) == "SUB foo 7\r\n"
     @test String(NATS.unsub_frame(7)) == "UNSUB 7\r\n"
     @test JetStream.api_subject("STREAM.INFO.FOO") == "\$JS.API.STREAM.INFO.FOO"
@@ -1230,6 +1262,32 @@ end
     NATS.add_discovered_servers!(servers, first(servers), info)
     @test any(server -> server.scheme == "ws" && server.port == 8081, servers)
     @test !any(server -> server.scheme == "ws" && server.port == 4222, servers)
+
+    authenticated = NATS.parse_server_url("nats://alice:secret@seed.example:4222")
+    authenticated_servers = [authenticated]
+    NATS.add_discovered_servers!(
+        authenticated_servers,
+        authenticated,
+        NATS.ServerInfo(connect_urls = ["node.example:4222"]),
+    )
+    discovered = authenticated_servers[2]
+    @test discovered.raw == "nats://node.example:4222"
+    @test discovered.user == "alice"
+    @test discovered.password == "secret"
+    discovered_connect = JSON3.read(String(NATS.connect_payload(NATS.Options(), discovered, NATS.ServerInfo(headers = true), false))[9:end-2])
+    @test discovered_connect.user == "alice"
+    @test discovered_connect.pass == "secret"
+
+    tls_seed = NATS.parse_server_url("tls://seed.example:4222")
+    tls_discovered = only(NATS.advertised_server_urls(
+        tls_seed,
+        NATS.ServerInfo(connect_urls = ["127.0.0.1:4222"]),
+    ))
+    @test tls_discovered.host == "127.0.0.1"
+    @test tls_discovered.tls_server_name == "seed.example"
+    @test NATS.tls_config(tls_discovered, NATS.TLSOptions()).server_name == "seed.example"
+    @test NATS.tls_config(tls_discovered, NATS.TLSOptions(server_name = "override.example")).server_name == "override.example"
+
     ws_with_query = NATS.parse_server_url("ws://localhost:8080/nats?token=abc&x=1")
     @test ws_with_query.path == "/nats"
     @test ws_with_query.query == "token=abc&x=1"
@@ -1476,6 +1534,26 @@ end
     end
     @test_throws ArgumentError NATS.find_user_jwt("not credentials")
     @test_throws ArgumentError NATS.find_user_nkey_seed("not credentials")
+
+    credential_server = NATS.parse_server_url("nats://alice:secret@example.com:4222")
+    credential_conn = NATS.new_connection(
+        credential_server,
+        [credential_server],
+        NATS.Options(allow_reconnect = false),
+        IOBuffer(),
+        NATS.ServerInfo(headers = true),
+        NATS.CONNECTED;
+        connected_once = true,
+    )
+    try
+        @test NATS.connected_url(credential_conn) == "nats://alice:secret@example.com:4222"
+        @test NATS.connected_url_redacted(credential_conn) == "nats://example.com:4222"
+        @test NATS.servers(credential_conn) == ["nats://example.com:4222"]
+        @test !occursin("alice", sprint(show, credential_conn))
+        @test !occursin("secret", sprint(show, credential_conn))
+    finally
+        NATS.close(credential_conn)
+    end
 end
 
 @testset "reconnect delay policy" begin
@@ -1555,6 +1633,22 @@ with_flush_hang_mock() do url, events, ready
 end
 
 @testset "ping liveness" begin
+    timer_server = NATS.parse_server_url("nats://127.0.0.1:4222")
+    timer_conn = NATS.new_connection(
+        timer_server,
+        [timer_server],
+        NATS.Options(ping_interval = 60.0, allow_reconnect = false),
+        IOBuffer(),
+        NATS.ServerInfo(headers = true),
+        NATS.CONNECTED;
+        connected_once = true,
+    )
+    NATS.start_ping_loop!(timer_conn)
+    timer_task = timer_conn.ping_task
+    yield()
+    NATS.close(timer_conn)
+    @test timedwait(() -> istaskdone(timer_task), 0.5; pollint = 0.001) == :ok
+
     with_ping_liveness_mock(respond_timer_pings = false, max_timer_pings = 3) do url, events, ready
         closed = Channel{Bool}(1)
         conn = NATS.connect(
@@ -6041,6 +6135,24 @@ end
 
 with_nats_container() do _container, url, port
     @testset "write-error reconnect policy" begin
+        flush_error_conn, flush_error_io = flush_error_connection(url)
+        try
+            err = try
+                NATS.publish(flush_error_conn, "natsjl.flush-error.default", "data")
+                nothing
+            catch err
+                err
+            end
+            @test err === flush_error_io.err
+            @test wait_ready(flush_error_conn.async_errors) === flush_error_io.err
+            @test NATS.last_error(flush_error_conn) === flush_error_io.err
+            @test NATS.stats(flush_error_conn).out_msgs == 0
+            @test NATS.connection_status(flush_error_conn) == NATS.CONNECTED
+            @test !flush_error_io.closed
+        finally
+            NATS.close(flush_error_conn)
+        end
+
         default_error_conn, default_io = write_error_connection(url)
         try
             err = try
@@ -6104,6 +6216,147 @@ with_nats_container() do _container, url, port
             NATS.close(reconnect_conn)
             NATS.close(receiver)
         end
+    end
+end
+
+@testset "timeout and terminal cleanup regressions" begin
+    async_server = NATS.parse_server_url("nats://127.0.0.1:4222")
+    async_conn = NATS.new_connection(
+        async_server,
+        [async_server],
+        NATS.Options(allow_reconnect = false),
+        IOBuffer(),
+        NATS.ServerInfo(headers = true, max_payload = 1048576),
+        NATS.CONNECTED;
+        connected_once = true,
+    )
+    no_stream_msg = NATS.Msg("_INBOX.audit", 1, nothing, Pair{String,String}[], UInt8[], 503, "No Responders")
+    async_msg = JetStream.AsyncPublishMessage("audit.async-timeout", UInt8[], Pair{String,String}[])
+    warm_ch = Channel{Any}(2)
+    put!(warm_ch, no_stream_msg)
+    put!(warm_ch, no_stream_msg)
+    warm_task = JetStream.pub_ack_task(
+        async_conn,
+        async_msg,
+        "_INBOX.audit",
+        "warm-token",
+        warm_ch,
+        0.01;
+        retry_attempts = 2,
+        retry_wait = 0.008,
+        error_cb = nothing,
+    )
+    try Base.fetch(warm_task) catch end
+
+    async_ch = Channel{Any}(2)
+    put!(async_ch, no_stream_msg)
+    put!(async_ch, no_stream_msg)
+    async_started = time()
+    async_task = JetStream.pub_ack_task(
+        async_conn,
+        async_msg,
+        "_INBOX.audit",
+        "audit-token",
+        async_ch,
+        0.1;
+        retry_attempts = 2,
+        retry_wait = 0.08,
+        error_cb = nothing,
+    )
+    async_err = try
+        Base.fetch(async_task)
+        nothing
+    catch err
+        err isa TaskFailedException ? Base.current_exceptions(err.task)[1].exception : err
+    end
+    @test async_err isa NATS.ConnectionTimeoutError
+    @test async_err.operation == "publish_async"
+    @test async_err.timeout == 0.1
+    @test time() - async_started < 0.2
+    NATS.close(async_conn)
+
+    reconnect_server = NATS.parse_server_url("nats://127.0.0.1:4222")
+    replacement_io = IOBuffer()
+    already_reconnecting = NATS.new_connection(
+        reconnect_server,
+        [reconnect_server],
+        NATS.Options(),
+        replacement_io,
+        NATS.ServerInfo(headers = true),
+        NATS.RECONNECTING;
+        connected_once = true,
+    )
+    NATS.start_reconnect!(already_reconnecting, ErrorException("duplicate reconnect"))
+    @test isopen(replacement_io)
+    @test already_reconnecting.reconnect_task === nothing
+    NATS.close(already_reconnecting)
+
+    cleanup_server = NATS.parse_server_url("nats://127.0.0.1:4222")
+    cleanup_conn = NATS.new_connection(
+        cleanup_server,
+        [cleanup_server],
+        NATS.Options(allow_reconnect = false),
+        IOBuffer(),
+        NATS.ServerInfo(headers = true, max_payload = 1048576),
+        NATS.CONNECTED;
+        connected_once = true,
+    )
+    cleanup_sub = NATS.subscribe(cleanup_conn, "_INBOX.natsjl.terminal-cleanup")
+    JetStream.register_ack_none_consumer!(cleanup_conn, "", "STREAM", "CONSUMER")
+    JetStream.register_subscription_consumer_cleanup!(
+        cleanup_conn,
+        cleanup_sub,
+        "STREAM",
+        "CONSUMER",
+        JetStream.DEFAULT_API_PREFIX,
+        false,
+        true,
+    )
+    cleanup_psub = JetStream.PullSubscription(
+        cleanup_conn,
+        "STREAM",
+        "CONSUMER",
+        JetStream.DEFAULT_API_PREFIX,
+        "_INBOX.natsjl.terminal-cleanup",
+        cleanup_sub,
+        nothing,
+        nothing,
+        nothing,
+        nothing,
+        false,
+        true,
+        ReentrantLock(),
+        false,
+    )
+    cleanup_key = JetStream.ack_none_key(cleanup_conn, "", "STREAM", "CONSUMER")
+    @test haskey(JetStream.ACK_NONE_CONSUMERS, cleanup_key)
+    NATS.close(cleanup_conn)
+    @test !haskey(JetStream.ACK_NONE_CONSUMERS, cleanup_key)
+    @test close(cleanup_psub) === nothing
+
+    server = NATS.parse_server_url("nats://127.0.0.1:1")
+    reconnecting = NATS.new_connection(
+        server,
+        [server],
+        NATS.Options(request_timeout = 0.2),
+        nothing,
+        NATS.ServerInfo(headers = true),
+        NATS.RECONNECTING;
+        connected_once = false,
+    )
+    try
+        err = try
+            NATS.request(reconnecting, "natsjl.request-timeout", "payload"; timeout = 0.01, mux = false)
+            nothing
+        catch err
+            err
+        end
+        @test err isa NATS.ConnectionTimeoutError
+        @test err.operation == "request"
+        @test err.timeout == 0.01
+        @test NATS.num_subscriptions(reconnecting) == 0
+    finally
+        NATS.close(reconnecting)
     end
 end
 
@@ -6277,7 +6530,7 @@ with_nats_container() do first_container, first_url, first_port
             no_randomize = true,
             reconnect_wait = 0.05,
             reconnect_jitter = 0.0,
-            max_reconnect = 60,
+            max_reconnect = 200,
             error_cb = (_conn, err) -> put!(errors, err),
             disconnected_cb = (_conn, err) -> put!(disconnected, err),
             reconnected_cb = conn -> put!(reconnected, conn.url.port),
@@ -6289,7 +6542,7 @@ with_nats_container() do first_container, first_url, first_port
             no_randomize = true,
             reconnect_wait = 0.05,
             reconnect_jitter = 0.0,
-            max_reconnect = 60,
+            max_reconnect = 200,
             reconnect_buffer_size = -1,
             disconnected_cb = (_conn, err) -> put!(no_buffer_disconnected, err),
             closed_cb = conn -> put!(no_buffer_closed, NATS.connection_status(conn)),
@@ -6300,7 +6553,7 @@ with_nats_container() do first_container, first_url, first_port
             no_randomize = true,
             reconnect_wait = 0.05,
             reconnect_jitter = 0.0,
-            max_reconnect = 60,
+            max_reconnect = 200,
             reconnect_buffer_size = 2 * length(small_frame),
             disconnected_cb = (_conn, err) -> put!(small_buffer_disconnected, err),
         )

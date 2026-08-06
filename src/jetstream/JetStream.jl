@@ -1241,12 +1241,20 @@ function pub_ack_task(
     error_cb::Union{Nothing, Function},
 )
     return @async begin
+        timeout_s = Float64(timeout)
+        deadline = time() + timeout_s
         try
             retries = 0
             while true
-                result = timedwait(() -> isready(ch) || !isopen(ch), timeout; pollint = 0.001)
+                remaining = deadline - time()
+                if remaining <= 0
+                    err = NATS.ConnectionTimeoutError("publish_async", timeout_s)
+                    publish_async_error!(conn, error_cb, msg, err)
+                    throw(err)
+                end
+                result = timedwait(() -> isready(ch) || !isopen(ch), remaining; pollint = 0.001)
                 if result != :ok
-                    err = NATS.ConnectionTimeoutError("publish_async", Float64(timeout))
+                    err = NATS.ConnectionTimeoutError("publish_async", timeout_s)
                     publish_async_error!(conn, error_cb, msg, err)
                     throw(err)
                 end
@@ -1268,7 +1276,18 @@ function pub_ack_task(
                 if is_no_stream_response(ack_msg)
                     if retries < retry_attempts
                         retries += 1
-                        sleep(Float64(retry_wait))
+                        sleep_time = min(Float64(retry_wait), deadline - time())
+                        if sleep_time <= 0
+                            err = NATS.ConnectionTimeoutError("publish_async", timeout_s)
+                            publish_async_error!(conn, error_cb, msg, err)
+                            throw(err)
+                        end
+                        sleep(sleep_time)
+                        if time() >= deadline
+                            err = NATS.ConnectionTimeoutError("publish_async", timeout_s)
+                            publish_async_error!(conn, error_cb, msg, err)
+                            throw(err)
+                        end
                         try
                             republish_async_msg(conn, msg, reply)
                         catch err
@@ -2399,7 +2418,8 @@ function register_subscription_consumer_cleanup!(
         sub,
         timeout -> begin
             ack_none && unregister_ack_none_consumer!(conn, domain, stream_s, consumer_s)
-            delete_on_cleanup && delete_consumer(conn, stream_s, consumer_s; timeout, api_prefix = prefix)
+            delete_on_cleanup && !NATS.is_closed(conn) &&
+                delete_consumer(conn, stream_s, consumer_s; timeout, api_prefix = prefix)
         end,
     )
     return nothing
@@ -2604,7 +2624,7 @@ function Base.close(psub::PushSubscription)
         try
             NATS.unsubscribe(psub.connection, psub.subscription)
         catch err
-            err isa NATS.BadSubscriptionError || rethrow()
+            (err isa NATS.BadSubscriptionError || err isa NATS.ConnectionClosedError) || rethrow()
         end
     finally
         unlock(psub.lock)
@@ -2739,7 +2759,7 @@ function Base.close(psub::PullSubscription)
         try
             NATS.unsubscribe(psub.connection, psub.subscription)
         catch err
-            err isa NATS.BadSubscriptionError || rethrow()
+            (err isa NATS.BadSubscriptionError || err isa NATS.ConnectionClosedError) || rethrow()
         end
     finally
         unlock(psub.lock)

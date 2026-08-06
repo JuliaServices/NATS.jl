@@ -147,9 +147,9 @@ conn = NATS.connect(
     reconnect_wait = 0.5,
     reconnect_jitter = 0.1,
     reconnect_buffer_size = 8 * 1024 * 1024,
-    connected_cb = conn -> @info "connected" url = NATS.connected_url(conn),
+    connected_cb = conn -> @info "connected" url = NATS.connected_url_redacted(conn),
     disconnected_cb = (conn, err) -> @warn "disconnected" err,
-    reconnected_cb = conn -> @info "reconnected" url = NATS.connected_url(conn),
+    reconnected_cb = conn -> @info "reconnected" url = NATS.connected_url_redacted(conn),
     error_cb = (conn, sub, err) -> @warn "async NATS error" subject = (sub === nothing ? nothing : sub.subject) err,
 )
 

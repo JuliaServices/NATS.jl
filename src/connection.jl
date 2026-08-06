@@ -133,6 +133,7 @@ mutable struct Connection
     reader_task::Union{Nothing, Task}
     reconnect_task::Union{Nothing, Task}
     ping_task::Union{Nothing, Task}
+    ping_timer::Union{Nothing, Timer}
     pongs::Channel{Nothing}
     pings_out::Int
     async_errors::Channel{Any}
@@ -149,7 +150,7 @@ mutable struct Connection
 end
 
 function Base.show(io::IO, conn::Connection)
-    print(io, "NATS.Connection(", conn.url.raw, ", ", conn.status, ", ", length(conn.subscriptions), " subscriptions)")
+    print(io, "NATS.Connection(", url_without_auth(conn.url), ", ", conn.status, ", ", length(conn.subscriptions), " subscriptions)")
 end
 
 function safe_callback(conn::Connection, cb::Union{Nothing, Function}, args...)
@@ -287,6 +288,22 @@ end
 function run_subscription_cleanup!(conn::Connection, sub::Subscription, timeout::Real; throw_errors::Bool)
     cb = take_subscription_cleanup!(conn, sub)
     return run_subscription_cleanup(conn, cb, timeout; throw_errors)
+end
+
+function take_all_subscription_cleanups_locked!(conn::Connection)
+    cleanups = collect(values(conn.subscription_cleanups))
+    empty!(conn.subscription_cleanups)
+    return cleanups
+end
+
+function run_terminal_subscription_cleanups!(cleanups::Vector{Function})
+    for cleanup in cleanups
+        try
+            cleanup(0.0)
+        catch
+        end
+    end
+    return nothing
 end
 
 function run_subscription_cleanups!(conn::Connection, subs::Vector{Subscription}, deadline::Real, operation::AbstractString)
@@ -607,6 +624,10 @@ end
 function set_connection_status_locked!(conn::Connection, status::ConnectionStatus)
     conn.status == status && return nothing
     conn.status = status
+    if status == CLOSED && conn.ping_timer !== nothing
+        close(conn.ping_timer::Timer)
+        conn.ping_timer = nothing
+    end
     send_connection_status_locked!(conn, status)
     return nothing
 end
@@ -686,7 +707,7 @@ end
 function servers(conn::Connection)
     lock(conn.lock)
     try
-        return [server.raw for server in conn.servers]
+        return [url_without_auth(server) for server in conn.servers]
     finally
         unlock(conn.lock)
     end
@@ -695,7 +716,7 @@ end
 function discovered_servers(conn::Connection)
     lock(conn.lock)
     try
-        return [server.raw for server in conn.servers if server_key(server) in conn.discovered_server_keys]
+        return [url_without_auth(server) for server in conn.servers if server_key(server) in conn.discovered_server_keys]
     finally
         unlock(conn.lock)
     end
@@ -770,6 +791,11 @@ end
 connected_url(conn::Connection) = begin
     info = connected_info(conn)
     info === nothing ? "" : info[1].raw
+end
+
+connected_url_redacted(conn::Connection) = begin
+    info = connected_info(conn)
+    info === nothing ? "" : url_without_auth(info[1])
 end
 
 connected_server_id(conn::Connection) = begin
@@ -866,10 +892,7 @@ end
 
 function write_frame(io, frame::Vector{UInt8})
     write(io, frame)
-    try
-        flush(io)
-    catch
-    end
+    flush(io)
     return nothing
 end
 
@@ -1032,7 +1055,52 @@ function advertised_server_urls(base::ServerURL, info::ServerInfo)
         info.connect_urls
     end
     raw_urls === nothing && return nothing
-    return [parse_server_url(occursin("://", raw) ? raw : "$(base.scheme)://$raw") for raw in raw_urls]
+    return [
+        inherit_server_context(
+            parse_server_url(occursin("://", raw) ? raw : "$(base.scheme)://$raw"),
+            base,
+        )
+        for raw in raw_urls
+    ]
+end
+
+function inherit_server_context(server::ServerURL, base::ServerURL)
+    inherited_user = server.user === nothing ? base.user : server.user
+    inherited_password = server.user === nothing ? base.password : server.password
+    inherited_tls_server_name = server.tls_server_name
+    if inherited_tls_server_name === nothing && is_ip_literal(server.host)
+        inherited_tls_server_name = if base.tls_server_name !== nothing
+            base.tls_server_name
+        elseif !is_ip_literal(base.host)
+            base.host
+        else
+            nothing
+        end
+    end
+    inherited_user == server.user &&
+        inherited_password == server.password &&
+        inherited_tls_server_name == server.tls_server_name && return server
+    return ServerURL(
+        server.raw,
+        server.scheme,
+        server.host,
+        server.port,
+        inherited_user,
+        inherited_password,
+        server.path,
+        server.query,
+        inherited_tls_server_name,
+    )
+end
+
+function is_ip_literal(host::AbstractString)
+    try
+        parse(IPAddr, host)
+        return true
+    catch err
+        err isa ArgumentError || rethrow()
+        return false
+    end
 end
 
 function add_discovered_servers!(servers::Vector{ServerURL}, base::ServerURL, info::ServerInfo)
@@ -1141,6 +1209,7 @@ function new_connection(
         nothing,
         nothing,
         nothing,
+        nothing,
         Channel{Nothing}(Inf),
         0,
         Channel{Any}(Inf),
@@ -1204,7 +1273,31 @@ end
 function ping_loop(conn::Connection)
     interval = conn.options.ping_interval
     while true
-        sleep(interval)
+        timer = Timer(interval)
+        lock(conn.lock)
+        try
+            if conn.status == CLOSED
+                close(timer)
+                return nothing
+            end
+            conn.ping_timer = timer
+        finally
+            unlock(conn.lock)
+        end
+        try
+            wait(timer)
+        catch err
+            connection_status(conn) == CLOSED && return nothing
+            rethrow()
+        finally
+            lock(conn.lock)
+            try
+                conn.ping_timer === timer && (conn.ping_timer = nothing)
+            finally
+                unlock(conn.lock)
+            end
+            close(timer)
+        end
         status = connection_status(conn)
         status == CLOSED && return nothing
         status == CONNECTED || continue
@@ -1270,6 +1363,7 @@ end
 function close(conn::Connection)
     should_notify = false
     subs = Subscription[]
+    cleanups = Function[]
     err = ConnectionClosedError("connection is closed")
     lock(conn.lock)
     try
@@ -1280,7 +1374,7 @@ function close(conn::Connection)
         empty!(conn.subscriptions)
         empty!(conn.pending_frames)
         conn.pending_bytes = 0
-        empty!(conn.subscription_cleanups)
+        cleanups = take_all_subscription_cleanups_locked!(conn)
         abort_pub_ack_futures_locked!(conn, err)
         for ch in values(conn.request_map)
             close(ch)
@@ -1294,6 +1388,7 @@ function close(conn::Connection)
     for sub in subs
         close_subscription_local!(conn, sub; err)
     end
+    run_terminal_subscription_cleanups!(cleanups)
     try close(conn.io) catch end
     should_notify && notify_closed!(conn)
     return nothing
@@ -1301,11 +1396,12 @@ end
 
 function close_subscriptions!(conn::Connection; err::Exception = ConnectionClosedError("connection is closed"))
     subs = Subscription[]
+    cleanups = Function[]
     lock(conn.lock)
     try
         subs = collect(values(conn.subscriptions))
         empty!(conn.subscriptions)
-        empty!(conn.subscription_cleanups)
+        cleanups = take_all_subscription_cleanups_locked!(conn)
         abort_pub_ack_futures_locked!(conn, err)
         for ch in values(conn.request_map)
             close(ch)
@@ -1319,6 +1415,7 @@ function close_subscriptions!(conn::Connection; err::Exception = ConnectionClose
     for sub in subs
         close_subscription_local!(conn, sub; err)
     end
+    run_terminal_subscription_cleanups!(cleanups)
     return nothing
 end
 
@@ -1379,17 +1476,16 @@ function start_reconnect!(conn::Connection, err)
     finally
         unlock(conn.lock)
     end
+    should_start || return nothing
     notify_error!(conn, err)
-    should_start && notify_disconnected!(conn, err)
-    should_start && record_auth_error!(conn, conn.url, err)
+    notify_disconnected!(conn, err)
+    record_auth_error!(conn, conn.url, err)
     while isready(conn.pongs)
         take!(conn.pongs)
     end
     reset_pings_out!(conn)
     try close(conn.io) catch end
-    if should_start
-        conn.reconnect_task = errormonitor(@async reconnect_loop(conn, err))
-    end
+    conn.reconnect_task = errormonitor(@async reconnect_loop(conn, err))
     return nothing
 end
 
@@ -2444,7 +2540,12 @@ end
 
 remaining_until(deadline::Real) = max(0.0, deadline - time())
 
-function unsubscribe(conn::Connection, sub::Subscription; max_msgs::Union{Nothing, Integer} = nothing)
+function unsubscribe(
+        conn::Connection,
+        sub::Subscription;
+        max_msgs::Union{Nothing, Integer} = nothing,
+        timeout::Real = conn.options.request_timeout,
+)
     max = max_msgs === nothing ? nothing : Int(max_msgs)
     max !== nothing && max < 0 && throw(ArgumentError("max_msgs must be nonnegative"))
     is_closed(conn) && throw(ConnectionClosedError("connection is closed"))
@@ -2469,11 +2570,11 @@ function unsubscribe(conn::Connection, sub::Subscription; max_msgs::Union{Nothin
         throw(BadSubscriptionError())
     end
     frame = immediate ? unsub_frame(sub.sid) : unsub_frame(sub.sid; max_msgs = max)
-    send_frame(conn, frame, timeout = conn.options.request_timeout, operation = "unsubscribe")
+    send_frame(conn, frame, timeout = timeout, operation = "unsubscribe")
     if immediate
         close_err = max !== nothing && max > 0 ? MaxMessagesError(max) : nothing
         close_subscription_local!(conn, sub; err = close_err)
-        run_subscription_cleanup!(conn, sub, conn.options.request_timeout; throw_errors = true)
+        run_subscription_cleanup!(conn, sub, timeout; throw_errors = true)
     end
     return nothing
 end
@@ -2690,16 +2791,28 @@ end
 function request_exact(conn::Connection, subject::AbstractString, data = nothing; timeout::Real = conn.options.request_timeout, headers::Vector{Pair{String,String}} = Pair{String,String}[])
     subject_s = validate_publish_subject(subject; skip = conn.options.skip_subject_validation)
     ensure_headers_supported(conn, headers)
+    timeout_s = Float64(timeout)
+    deadline = time() + timeout_s
     inbox = new_inbox(conn)
     sub = subscribe(conn, inbox; channel_size = 1)
     try
-        unsubscribe(conn, sub; max_msgs = 1)
+        remaining = remaining_until(deadline)
+        remaining > 0 || throw(ConnectionTimeoutError("request", timeout_s))
+        unsubscribe(conn, sub; max_msgs = 1, timeout = remaining)
         publish(conn, subject_s, data; reply = inbox, headers)
-        return check_request_response(next_msg(sub; timeout), subject_s)
+        remaining = remaining_until(deadline)
+        remaining > 0 || throw(ConnectionTimeoutError("request", timeout_s))
+        return check_request_response(next_msg(sub; timeout = remaining), subject_s)
+    catch err
+        err isa ConnectionTimeoutError && throw(ConnectionTimeoutError("request", timeout_s))
+        rethrow()
     finally
-        try
-            unsubscribe(conn, sub)
-        catch
+        if !sub.closed
+            try
+                unsubscribe(conn, sub; timeout = remaining_until(deadline))
+            catch
+                close_subscription_local!(conn, sub)
+            end
         end
     end
 end

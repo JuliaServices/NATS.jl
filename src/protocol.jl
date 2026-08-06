@@ -137,15 +137,23 @@ end
 
 function parse_msg_line(line::AbstractString, io, has_headers::Bool)
     parts = split(line)
-    min_fields = has_headers ? 5 : 4
-    length(parts) >= min_fields || throw(ProtocolError("malformed message line: $(repr(line))"))
+    valid_field_counts = has_headers ? (5, 6) : (4, 5)
+    length(parts) in valid_field_counts || throw(ProtocolError("malformed message line: $(repr(line))"))
     subject = String(parts[2])
-    sid = parse(Int, parts[3])
+    parse_field(token) = try
+        parse(Int, token)
+    catch err
+        err isa ArgumentError || rethrow()
+        throw(ProtocolError("malformed message line: $(repr(line))"))
+    end
+    sid = parse_field(parts[3])
+    sid >= 0 || throw(ProtocolError("negative subscription id"))
     if has_headers
         has_reply = length(parts) == 6
         reply = has_reply ? String(parts[4]) : nothing
-        hbytes = parse(Int, parts[has_reply ? 5 : 4])
-        total = parse(Int, parts[has_reply ? 6 : 5])
+        hbytes = parse_field(parts[has_reply ? 5 : 4])
+        total = parse_field(parts[has_reply ? 6 : 5])
+        hbytes >= 0 || throw(ProtocolError("negative header size"))
         raw = read_payload(io, total)
         hbytes <= total || throw(ProtocolError("header bytes exceed payload size"))
         headers, status, description = parse_header_block(raw[1:hbytes])
@@ -154,7 +162,7 @@ function parse_msg_line(line::AbstractString, io, has_headers::Bool)
     else
         has_reply = length(parts) == 5
         reply = has_reply ? String(parts[4]) : nothing
-        size = parse(Int, parts[has_reply ? 5 : 4])
+        size = parse_field(parts[has_reply ? 5 : 4])
         data = read_payload(io, size)
         return Msg(subject, sid, reply, Pair{String,String}[], data, 200, "")
     end

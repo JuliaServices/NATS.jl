@@ -19,7 +19,11 @@ struct ServerURL
     password::Union{Nothing, String}
     path::String
     query::String
+    tls_server_name::Union{Nothing, String}
 end
+
+ServerURL(raw, scheme, host, port, user, password, path, query) =
+    ServerURL(raw, scheme, host, port, user, password, path, query, nothing)
 
 function default_port(scheme::AbstractString)
     scheme == "ws" && return 80
@@ -43,12 +47,19 @@ function parse_server_url(raw::AbstractString)
     end
     path = isempty(uri.path) ? "" : String(uri.path)
     query = isempty(uri.query) ? "" : String(uri.query)
-    return ServerURL(s, scheme, host, port, user, password, path, query)
+    return ServerURL(s, scheme, host, port, user, password, path, query, nothing)
 end
 
 address(url::ServerURL) = "$(url.host):$(url.port)"
 is_tls_scheme(url::ServerURL) = url.scheme in ("tls", "wss")
 is_websocket_scheme(url::ServerURL) = url.scheme in ("ws", "wss")
+
+function url_without_auth(url::ServerURL)
+    host = occursin(':', url.host) ? "[$(url.host)]" : url.host
+    path = isempty(url.path) ? "" : url.path
+    query = isempty(url.query) ? "" : "?$(url.query)"
+    return "$(url.scheme)://$host:$(url.port)$path$query"
+end
 
 duration_ns(seconds::Real) = Int64(round(seconds * 1_000_000_000))
 
@@ -112,7 +123,7 @@ function Base.flush(::WebSocketTransport)
 end
 
 function tls_config(url::ServerURL, tls::TLSOptions)
-    server_name = something(tls.server_name, url.host)
+    server_name = something(tls.server_name, url.tls_server_name, url.host)
     return Reseau.TLS.Config(
         server_name = server_name,
         verify_peer = tls.verify_peer,
