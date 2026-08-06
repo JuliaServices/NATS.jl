@@ -1241,12 +1241,20 @@ function pub_ack_task(
     error_cb::Union{Nothing, Function},
 )
     return @async begin
+        timeout_s = Float64(timeout)
+        deadline = time() + timeout_s
         try
             retries = 0
             while true
-                result = timedwait(() -> isready(ch) || !isopen(ch), timeout; pollint = 0.001)
+                remaining = deadline - time()
+                if remaining <= 0
+                    err = NATS.ConnectionTimeoutError("publish_async", timeout_s)
+                    publish_async_error!(conn, error_cb, msg, err)
+                    throw(err)
+                end
+                result = timedwait(() -> isready(ch) || !isopen(ch), remaining; pollint = 0.001)
                 if result != :ok
-                    err = NATS.ConnectionTimeoutError("publish_async", Float64(timeout))
+                    err = NATS.ConnectionTimeoutError("publish_async", timeout_s)
                     publish_async_error!(conn, error_cb, msg, err)
                     throw(err)
                 end
@@ -1268,7 +1276,18 @@ function pub_ack_task(
                 if is_no_stream_response(ack_msg)
                     if retries < retry_attempts
                         retries += 1
-                        sleep(Float64(retry_wait))
+                        sleep_time = min(Float64(retry_wait), deadline - time())
+                        if sleep_time <= 0
+                            err = NATS.ConnectionTimeoutError("publish_async", timeout_s)
+                            publish_async_error!(conn, error_cb, msg, err)
+                            throw(err)
+                        end
+                        sleep(sleep_time)
+                        if time() >= deadline
+                            err = NATS.ConnectionTimeoutError("publish_async", timeout_s)
+                            publish_async_error!(conn, error_cb, msg, err)
+                            throw(err)
+                        end
                         try
                             republish_async_msg(conn, msg, reply)
                         catch err
@@ -2399,7 +2418,8 @@ function register_subscription_consumer_cleanup!(
         sub,
         timeout -> begin
             ack_none && unregister_ack_none_consumer!(conn, domain, stream_s, consumer_s)
-            delete_on_cleanup && delete_consumer(conn, stream_s, consumer_s; timeout, api_prefix = prefix)
+            delete_on_cleanup && !NATS.is_closed(conn) &&
+                delete_consumer(conn, stream_s, consumer_s; timeout, api_prefix = prefix)
         end,
     )
     return nothing
@@ -2604,7 +2624,7 @@ function Base.close(psub::PushSubscription)
         try
             NATS.unsubscribe(psub.connection, psub.subscription)
         catch err
-            err isa NATS.BadSubscriptionError || rethrow()
+            (err isa NATS.BadSubscriptionError || err isa NATS.ConnectionClosedError) || rethrow()
         end
     finally
         unlock(psub.lock)
@@ -2739,7 +2759,7 @@ function Base.close(psub::PullSubscription)
         try
             NATS.unsubscribe(psub.connection, psub.subscription)
         catch err
-            err isa NATS.BadSubscriptionError || rethrow()
+            (err isa NATS.BadSubscriptionError || err isa NATS.ConnectionClosedError) || rethrow()
         end
     finally
         unlock(psub.lock)
@@ -2815,13 +2835,19 @@ function fetch(
     try
         ensure_pull_subscription_open_locked(psub)
         check_pull_subscription_limits(psub, batch, expires_ns, no_wait, max_bytes)
-        NATS.publish(
-            psub.connection,
-            pull_request_subject(psub.stream, psub.consumer; api_prefix = psub.api_prefix),
-            next_request_body(; batch, expires_ns, no_wait, max_bytes, min_pending, min_ack_pending, priority_group, priority, heartbeat_ns);
-            reply = psub.inbox,
+        return fetch_pull_request(
+            psub,
+            batch,
+            expires_ns,
+            no_wait,
+            timeout,
+            max_bytes,
+            min_pending,
+            min_ack_pending,
+            priority_group,
+            priority,
+            heartbeat_ns,
         )
-        return collect_pull_messages(psub.subscription, batch, timeout; heartbeat_ns)
     finally
         unlock(psub.lock)
     end
@@ -2875,15 +2901,57 @@ function fetch_with_terminal(
     try
         ensure_pull_subscription_open_locked(psub)
         check_pull_subscription_limits(psub, batch, expires_ns, no_wait, max_bytes)
+        return fetch_pull_request(
+            psub,
+            batch,
+            expires_ns,
+            no_wait,
+            timeout,
+            max_bytes,
+            min_pending,
+            min_ack_pending,
+            priority_group,
+            priority,
+            heartbeat_ns;
+            return_terminal = true,
+        )
+    finally
+        unlock(psub.lock)
+    end
+end
+
+function fetch_pull_request(
+    psub::PullSubscription,
+    batch::Integer,
+    expires_ns::Integer,
+    no_wait::Bool,
+    timeout::Real,
+    max_bytes::Union{Nothing, Integer},
+    min_pending::Union{Nothing, Integer},
+    min_ack_pending::Union{Nothing, Integer},
+    priority_group::Union{Nothing, AbstractString},
+    priority::Union{Nothing, Integer},
+    heartbeat_ns::Union{Nothing, Integer};
+    return_terminal::Bool = false,
+)
+    inbox = NATS.new_inbox(psub.connection)
+    sub = NATS.subscribe(psub.connection, inbox; channel_size = max(2 * Int(batch), 1))
+    try
         NATS.publish(
             psub.connection,
             pull_request_subject(psub.stream, psub.consumer; api_prefix = psub.api_prefix),
             next_request_body(; batch, expires_ns, no_wait, max_bytes, min_pending, min_ack_pending, priority_group, priority, heartbeat_ns);
-            reply = psub.inbox,
+            reply = inbox,
         )
-        return collect_pull_messages(psub.subscription, batch, timeout; return_terminal = true, heartbeat_ns)
+        return collect_pull_messages(sub, batch, timeout; return_terminal, heartbeat_ns)
     finally
-        unlock(psub.lock)
+        if !sub.closed
+            try
+                NATS.unsubscribe(psub.connection, sub)
+            catch
+                NATS.close_subscription_local!(psub.connection, sub)
+            end
+        end
     end
 end
 
