@@ -3,11 +3,10 @@ module NATS
 import Base: close, flush
 
 using HTTP
-using JSON3
+using JSON
 using Random
 using Reseau
 using Sockets
-using StructTypes
 using URIs
 using Base64
 

@@ -32,7 +32,6 @@ Base.@kwdef struct ServerInfo <: ProtocolMessage
     domain::Union{Nothing, String} = nothing
 end
 
-StructTypes.StructType(::Type{ServerInfo}) = StructTypes.Struct()
 
 struct Ok <: ProtocolMessage end
 struct Ping <: ProtocolMessage end
@@ -94,7 +93,7 @@ end
 
 function parse_server_info(line::AbstractString)
     startswith(line, "INFO ") || throw(ProtocolError("expected INFO, got $(repr(line))"))
-    return JSON3.read(SubString(line, 6), ServerInfo)
+    return JSON.parse(SubString(line, 6), ServerInfo)
 end
 
 function parse_err(line::AbstractString)

@@ -1,10 +1,9 @@
 module JetStream
 
 using Base64
-using JSON3
+using JSON
 using Random: randstring
 using SHA
-using StructTypes
 
 import ..NATS
 
@@ -584,7 +583,7 @@ end
 
 function api_request(conn::NATS.Connection, subject::AbstractString, body = UInt8[]; timeout::Real = conn.options.request_timeout)
     msg = NATS.request(conn, subject, body; timeout)
-    obj = JSON3.read(NATS.payload(msg))
+    obj = JSON.parse(NATS.payload(msg))
     return throw_if_api_error(obj)
 end
 
@@ -621,7 +620,7 @@ function create_stream(
     domain::Union{Nothing, AbstractString} = nothing,
 )
     stream = validate_stream_name(config.name)
-    body = JSON3.write(config_dict(config))
+    body = JSON.json(config_dict(config))
     try
         return api_request(conn, api_subject("STREAM.CREATE.$stream"; api_prefix, domain), body; timeout)
     catch err
@@ -638,7 +637,7 @@ function update_stream(
     domain::Union{Nothing, AbstractString} = nothing,
 )
     stream = validate_stream_name(config.name)
-    body = JSON3.write(config_dict(config))
+    body = JSON.json(config_dict(config))
     try
         return api_request(conn, api_subject("STREAM.UPDATE.$stream"; api_prefix, domain), body; timeout)
     catch err
@@ -683,7 +682,7 @@ function stream_info_body(subjects_filter::Union{Nothing, AbstractString}, delet
     body = Dict{String, Any}()
     subjects_filter === nothing || (body["subjects_filter"] = String(subjects_filter))
     deleted_details === nothing || (body["deleted_details"] = deleted_details)
-    return JSON3.write(body)
+    return JSON.json(body)
 end
 
 function stream_info(
@@ -768,7 +767,7 @@ function stream_subjects(
     subjects = Dict{String, UInt64}()
     offset = 0
     while true
-        body = JSON3.write(Dict("subjects_filter" => String(subjects_filter), "offset" => offset))
+        body = JSON.json(Dict("subjects_filter" => String(subjects_filter), "offset" => offset))
         obj = api_request(conn, api_subject("STREAM.INFO.$name_s"; api_prefix, domain), body; timeout)
         if haskey(obj, :state) && haskey(obj.state, :subjects)
             for (subject, count) in pairs(obj.state.subjects)
@@ -795,7 +794,7 @@ function stream_names(
     while true
         body = Dict{String, Any}("offset" => offset)
         subject_filter === nothing || (body["subject"] = String(subject_filter))
-        obj = api_request(conn, api_subject("STREAM.NAMES"; api_prefix, domain), JSON3.write(body); timeout)
+        obj = api_request(conn, api_subject("STREAM.NAMES"; api_prefix, domain), JSON.json(body); timeout)
         page = string_vector_field(obj, :streams)
         for name in page
             push!(names, name)
@@ -821,7 +820,7 @@ function streams(
     while true
         body = Dict{String, Any}("offset" => offset)
         subject_filter === nothing || (body["subject"] = String(subject_filter))
-        obj = api_request(conn, api_subject("STREAM.LIST"; api_prefix, domain), JSON3.write(body); timeout)
+        obj = api_request(conn, api_subject("STREAM.LIST"; api_prefix, domain), JSON.json(body); timeout)
         page = object_vector_field(obj, :streams)
         append!(infos, page)
         total = Int(Base.get(obj, :total, length(infos)))
@@ -841,7 +840,7 @@ function stream_name_by_subject(
     domain::Union{Nothing, AbstractString} = nothing,
 )
     subject_s = NATS.validate_publish_subject(subject; skip = conn.options.skip_subject_validation)
-    obj = api_request(conn, api_subject("STREAM.NAMES"; api_prefix, domain), JSON3.write(Dict("subject" => subject_s)); timeout)
+    obj = api_request(conn, api_subject("STREAM.NAMES"; api_prefix, domain), JSON.json(Dict("subject" => subject_s)); timeout)
     streams = string_vector_field(obj, :streams)
     length(streams) == 1 || throw(NoMatchingStreamError(subject_s))
     return only(streams)
@@ -856,7 +855,7 @@ function stream_msg_get(
     domain::Union{Nothing, AbstractString} = nothing,
 )
     name_s = validate_stream_name(name)
-    obj = api_request(conn, api_subject("STREAM.MSG.GET.$name_s"; api_prefix, domain), JSON3.write(body); timeout)
+    obj = api_request(conn, api_subject("STREAM.MSG.GET.$name_s"; api_prefix, domain), JSON.json(body); timeout)
     haskey(obj, :message) || throw(JetStreamError(404, 0, "message not found"))
     return obj.message
 end
@@ -921,7 +920,7 @@ function direct_msg_get(
 )
     name_s = validate_stream_name(name)
     subject = api_subject("DIRECT.GET.$name_s"; api_prefix, domain)
-    msg = api_request_msg(conn, subject, JSON3.write(body); timeout)
+    msg = api_request_msg(conn, subject, JSON.json(body); timeout)
     return raw_msg_from_direct(name_s, subject, msg)
 end
 
@@ -987,7 +986,7 @@ function delete_msg(
     seq >= 1 || throw(ArgumentError("message sequence must be at least 1"))
     body = Dict{String, Any}("seq" => UInt64(seq))
     secure || (body["no_erase"] = true)
-    return api_request(conn, api_subject("STREAM.MSG.DELETE.$name_s"; api_prefix, domain), JSON3.write(body); timeout)
+    return api_request(conn, api_subject("STREAM.MSG.DELETE.$name_s"; api_prefix, domain), JSON.json(body); timeout)
 end
 
 secure_delete_msg(conn::NATS.Connection, name::AbstractString, seq::Integer; kwargs...) =
@@ -1011,7 +1010,7 @@ function purge_stream(
     seq !== nothing && keep !== nothing && throw(ArgumentError("purge seq and keep cannot both be provided"))
     seq === nothing || (body["seq"] = UInt64(seq))
     keep === nothing || (body["keep"] = UInt64(keep))
-    payload = isempty(body) ? UInt8[] : JSON3.write(body)
+    payload = isempty(body) ? UInt8[] : JSON.json(body)
     return api_request(conn, api_subject("STREAM.PURGE.$name_s"; api_prefix, domain), payload; timeout)
 end
 
@@ -1123,7 +1122,7 @@ function publish(
         schedule_timezone,
     )
     msg = request_publish_ack(conn, subject, data, hdr, timeout, retry_attempts, retry_wait)
-    return pub_ack(JSON3.read(NATS.payload(msg)))
+    return pub_ack(JSON.parse(NATS.payload(msg)))
 end
 
 function publish_async_pending(conn::NATS.Connection)
@@ -1226,7 +1225,7 @@ function async_ack_result(msg::NATS.Msg)
     if msg.status >= 400
         throw(JetStreamError(msg.status, 0, msg.description))
     end
-    return pub_ack(JSON3.read(NATS.payload(msg)))
+    return pub_ack(JSON.parse(NATS.payload(msg)))
 end
 
 function pub_ack_task(
@@ -1518,7 +1517,7 @@ end
 function consumer_config_body(stream::AbstractString, config, action::Union{Nothing, AbstractString})
     body = Dict{String, Any}("stream_name" => String(stream), "config" => config)
     action === nothing || (body["action"] = String(action))
-    return JSON3.write(body)
+    return JSON.json(body)
 end
 
 consumer_config_body(stream::AbstractString, config::ConsumerConfig, action::Union{Nothing, AbstractString}) =
@@ -1636,7 +1635,7 @@ function pause_consumer(
     stream_s = validate_stream_name(stream)
     consumer_s = validate_consumer_name(consumer)
     ensure_consumer_exists(conn, stream_s, consumer_s; timeout, api_prefix, domain)
-    body = pause_until === nothing ? UInt8[] : JSON3.write(Dict("pause_until" => String(pause_until)))
+    body = pause_until === nothing ? UInt8[] : JSON.json(Dict("pause_until" => String(pause_until)))
     try
         return api_request(conn, api_subject("CONSUMER.PAUSE.$stream_s.$consumer_s"; api_prefix, domain), body; timeout)
     catch err
@@ -1660,7 +1659,7 @@ function reset_consumer(
     stream_s = validate_stream_name(stream)
     consumer_s = validate_consumer_name(consumer)
     ensure_consumer_exists(conn, stream_s, consumer_s; timeout, api_prefix, domain)
-    body = JSON3.write(Dict{String, Any}())
+    body = JSON.json(Dict{String, Any}())
     resp = try
         api_request(conn, api_subject("CONSUMER.RESET.$stream_s.$consumer_s"; api_prefix, domain), body; timeout)
     catch err
@@ -1685,7 +1684,7 @@ function reset_consumer_to_sequence(
     stream_s = validate_stream_name(stream)
     consumer_s = validate_consumer_name(consumer)
     ensure_consumer_exists(conn, stream_s, consumer_s; timeout, api_prefix, domain)
-    body = JSON3.write(Dict("seq" => UInt64(seq)))
+    body = JSON.json(Dict("seq" => UInt64(seq)))
     resp = try
         api_request(conn, api_subject("CONSUMER.RESET.$stream_s.$consumer_s"; api_prefix, domain), body; timeout)
     catch err
@@ -1709,7 +1708,7 @@ function unpin_consumer(
     stream_s = validate_stream_name(stream)
     consumer_s = validate_consumer_name(consumer)
     ensure_consumer_exists(conn, stream_s, consumer_s; timeout, api_prefix, domain)
-    body = JSON3.write(Dict("group" => String(group)))
+    body = JSON.json(Dict("group" => String(group)))
     try
         return api_request(conn, api_subject("CONSUMER.UNPIN.$stream_s.$consumer_s"; api_prefix, domain), body; timeout)
     catch err
@@ -1731,7 +1730,7 @@ function consumer_names(
     offset = 0
     while true
         obj = try
-            api_request(conn, api_subject("CONSUMER.NAMES.$stream_s"; api_prefix, domain), JSON3.write(Dict("offset" => offset)); timeout)
+            api_request(conn, api_subject("CONSUMER.NAMES.$stream_s"; api_prefix, domain), JSON.json(Dict("offset" => offset)); timeout)
         catch err
             stream_not_found(err) && throw(StreamNotFoundError(stream_s))
             rethrow()
@@ -1762,7 +1761,7 @@ function consumers(
     offset = 0
     while true
         obj = try
-            api_request(conn, api_subject("CONSUMER.LIST.$stream_s"; api_prefix, domain), JSON3.write(Dict("offset" => offset)); timeout)
+            api_request(conn, api_subject("CONSUMER.LIST.$stream_s"; api_prefix, domain), JSON.json(Dict("offset" => offset)); timeout)
         catch err
             stream_not_found(err) && throw(StreamNotFoundError(stream_s))
             rethrow()
@@ -2164,7 +2163,7 @@ function next_request_body(;
     else
         body["expires"] = expires_ns
     end
-    return JSON3.write(body)
+    return JSON.json(body)
 end
 
 function normalized_status_description(msg::NATS.Msg)
@@ -3768,13 +3767,10 @@ function jsonish(value)
     value === nothing && return nothing
     value isa AbstractString && return String(value)
     value isa Symbol && return String(value)
+    # JSON.Object is an AbstractDict and JSON arrays are plain Vectors, so the
+    # two branches below also normalize freshly parsed JSON values.
     value isa AbstractDict && return Dict(String(k) => jsonish(v) for (k, v) in pairs(value))
     value isa AbstractVector && return [jsonish(item) for item in value]
-    if value isa JSON3.Object
-        return Dict(String(k) => jsonish(v) for (k, v) in pairs(value))
-    elseif value isa JSON3.Array
-        return [jsonish(item) for item in value]
-    end
     return value
 end
 
@@ -3814,7 +3810,7 @@ function create_key_value(
     api_prefix::Union{Nothing, AbstractString} = nothing,
     domain::Union{Nothing, AbstractString} = nothing,
 )
-    body = JSON3.write(kv_config_dict(config))
+    body = JSON.json(kv_config_dict(config))
     bucket = check_bucket(config.bucket)
     stream = kv_stream(bucket)
     prefix = api_prefix_value(; api_prefix, domain)
@@ -3840,7 +3836,7 @@ function update_key_value(
     api_prefix::Union{Nothing, AbstractString} = nothing,
     domain::Union{Nothing, AbstractString} = nothing,
 )
-    body = JSON3.write(kv_config_dict(config))
+    body = JSON.json(kv_config_dict(config))
     bucket = check_bucket(config.bucket)
     stream = kv_stream(bucket)
     prefix = api_prefix_value(; api_prefix, domain)
@@ -4654,7 +4650,7 @@ function create_object_store(
     domain::Union{Nothing, AbstractString} = nothing,
 )
     prefix = api_prefix_value(; api_prefix, domain)
-    api_request(conn, api_subject_from_prefix(prefix, "STREAM.CREATE.$(object_stream(check_bucket(config.bucket)))"), JSON3.write(object_store_config_dict(config)); timeout)
+    api_request(conn, api_subject_from_prefix(prefix, "STREAM.CREATE.$(object_stream(check_bucket(config.bucket)))"), JSON.json(object_store_config_dict(config)); timeout)
     return object_store_from_bucket(conn, config.bucket; api_prefix = prefix)
 end
 
@@ -4668,7 +4664,7 @@ function update_object_store(
     prefix = api_prefix_value(; api_prefix, domain)
     bucket = check_bucket(config.bucket)
     try
-        api_request(conn, api_subject_from_prefix(prefix, "STREAM.UPDATE.$(object_stream(bucket))"), JSON3.write(object_store_config_dict(config)); timeout)
+        api_request(conn, api_subject_from_prefix(prefix, "STREAM.UPDATE.$(object_stream(bucket))"), JSON.json(object_store_config_dict(config)); timeout)
     catch err
         stream_not_found(err) && throw(BucketNotFoundError(bucket))
         rethrow()
@@ -4833,7 +4829,7 @@ end
 
 function object_info_from_stored(stored)
     data = haskey(stored, :data) ? data_from_base64(stored.data) : UInt8[]
-    info = object_info_from_json(JSON3.read(data); stored_time = haskey(stored, :time) ? String(stored.time) : nothing)
+    info = object_info_from_json(JSON.parse(data); stored_time = haskey(stored, :time) ? String(stored.time) : nothing)
     return info
 end
 
@@ -4855,7 +4851,7 @@ function publish_object_info(store::ObjectStore, info::ObjectInfo; timeout::Real
     publish(
         store.connection,
         object_meta_subject(store.bucket, info.name),
-        JSON3.write(object_info_dict(info));
+        JSON.json(object_info_dict(info));
         timeout,
         headers = [MSG_ROLLUP_HEADER => "sub"],
         expected_stream = store.stream,
@@ -5161,9 +5157,9 @@ end
 
 function seal(store::ObjectStore; timeout::Real = store.connection.options.request_timeout)
     info = stream_info(store.connection, store.stream; timeout, api_prefix = store.api_prefix)
-    config = JSON3.read(JSON3.write(info.config), Dict{String, Any})
+    config = JSON.parse(JSON.json(info.config), Dict{String, Any})
     config["sealed"] = true
-    api_request(store.connection, api_subject_from_prefix(store.api_prefix, "STREAM.UPDATE.$(store.stream)"), JSON3.write(config); timeout)
+    api_request(store.connection, api_subject_from_prefix(store.api_prefix, "STREAM.UPDATE.$(store.stream)"), JSON.json(config); timeout)
     return nothing
 end
 
@@ -5185,7 +5181,7 @@ function object_watcher_loop(watcher::ObjectWatcher, initial_pending::UInt64, up
     try
         while true
             msg = NATS.next_msg(watcher.subscription)
-            info = object_info_from_json(JSON3.read(msg.data))
+            info = object_info_from_json(JSON.parse(msg.data))
             meta = metadata(msg)
             info = ObjectInfo(
                 name = info.name,
