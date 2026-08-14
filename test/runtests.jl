@@ -4,7 +4,7 @@ using NATS
 using NATS.JetStream
 using Harbor
 using HTTP
-using JSON3
+using JSON
 using Random
 using Reseau
 using SHA
@@ -351,7 +351,7 @@ function write_mock_info(sock, port::Integer; server_id::AbstractString = "mock"
         "max_payload" => 1048576,
     )
     nonce === nothing || (info["nonce"] = nonce)
-    write(sock, "INFO $(JSON3.write(info))\r\n")
+    write(sock, "INFO $(JSON.json(info))\r\n")
     flush(sock)
     return nothing
 end
@@ -805,7 +805,7 @@ function flush_error_connection(url::AbstractString; kwargs...)
 end
 
 function discovery_info(port::Integer, urls::Vector{String}; ldm::Bool = false)
-    return "INFO $(JSON3.write(Dict(
+    return "INFO $(JSON.json(Dict(
         "server_id" => "discovery-mock",
         "server_name" => "discovery-mock",
         "version" => "2.10.18",
@@ -966,7 +966,7 @@ function ws_info_line(server_id::AbstractString; ws_connect_urls = nothing)
         "max_payload" => 1048576,
     )
     ws_connect_urls === nothing || (info["ws_connect_urls"] = ws_connect_urls)
-    return "INFO $(JSON3.write(info))\r\n"
+    return "INFO $(JSON.json(info))\r\n"
 end
 
 function serve_ws_mock!(ws, events::Channel, label::Symbol, info_line::String)
@@ -1231,12 +1231,12 @@ end
     @test JetStream.overlapping_filter_subjects(JetStream.JetStreamError(500, 10138, "consumer subject filters cannot overlap"))
     @test !JetStream.overlapping_filter_subjects(JetStream.JetStreamError(500, 0, "other JetStream error"))
     @test startswith(sprint(showerror, JetStream.OverlappingFilterSubjectsError()), "JetStream consumer filter subjects")
-    echoed_filters_info = JSON3.read("""{"config":{"filter_subjects":["FOO.A","FOO.B"]}}""")
-    missing_filters_info = JSON3.read("""{"config":{}}""")
+    echoed_filters_info = JSON.parse("""{"config":{"filter_subjects":["FOO.A","FOO.B"]}}""")
+    missing_filters_info = JSON.parse("""{"config":{}}""")
     @test JetStream.ensure_multiple_filter_subjects_supported(echoed_filters_info, ["FOO.A", "FOO.B"]) === echoed_filters_info
     @test JetStream.ensure_multiple_filter_subjects_supported(missing_filters_info, nothing) === missing_filters_info
     @test_throws JetStream.MultipleFilterSubjectsNotSupportedError JetStream.ensure_multiple_filter_subjects_supported(missing_filters_info, ["FOO.A", "FOO.B"])
-    @test_throws JetStream.MultipleFilterSubjectsNotSupportedError JetStream.ensure_multiple_filter_subjects_supported(JSON3.read("{}"), ["FOO.A", "FOO.B"])
+    @test_throws JetStream.MultipleFilterSubjectsNotSupportedError JetStream.ensure_multiple_filter_subjects_supported(JSON.parse("{}"), ["FOO.A", "FOO.B"])
     @test startswith(sprint(showerror, JetStream.MultipleFilterSubjectsNotSupportedError()), "JetStream multiple consumer filter subjects")
     @test JetStream.consumer_name(JetStream.ConsumerConfig(name = "", durable_name = "DURABLE")) == "DURABLE"
     fallback_consumer_config = JetStream.config_dict(JetStream.ConsumerConfig(name = "", durable_name = "DURABLE"))
@@ -1314,7 +1314,7 @@ end
     @test discovered.raw == "nats://node.example:4222"
     @test discovered.user == "alice"
     @test discovered.password == "secret"
-    discovered_connect = JSON3.read(String(NATS.connect_payload(NATS.Options(), discovered, NATS.ServerInfo(headers = true), false))[9:end-2])
+    discovered_connect = JSON.parse(String(NATS.connect_payload(NATS.Options(), discovered, NATS.ServerInfo(headers = true), false))[9:end-2])
     @test discovered_connect.user == "alice"
     @test discovered_connect.pass == "secret"
 
@@ -1482,7 +1482,7 @@ end
 
     url = NATS.parse_server_url("nats://localhost:4222")
     info = NATS.ServerInfo(nonce = "anonce", headers = true)
-    connect_json(frame) = JSON3.read(match(r"^CONNECT (.*)\r\n$", String(frame)).captures[1])
+    connect_json(frame) = JSON.parse(match(r"^CONNECT (.*)\r\n$", String(frame)).captures[1])
 
     user_info_calls = Ref(0)
     user_info_options = NATS.Options(user_info_cb = () -> ("dynamic$(user_info_calls[] += 1)", "secret$(user_info_calls[])"))
@@ -2247,7 +2247,7 @@ with_nats() do url
 
             info_subject = NATS.Micro.control_subject(NATS.Micro.INFO, "CoolAddService")
             info_msg = NATS.request(conn, info_subject; timeout = 2)
-            info_json = JSON3.read(String(info_msg.data))
+            info_json = JSON.parse(String(info_msg.data))
             @test info_json.type == NATS.Micro.INFO_RESPONSE_TYPE
             @test info_json.name == "CoolAddService"
             @test length(info_json.endpoints) == 1
@@ -2260,7 +2260,7 @@ with_nats() do url
                     replies = Any[]
                     deadline = time() + 2
                     while length(replies) < expected && time() < deadline
-                        push!(replies, JSON3.read(String(NATS.next_msg(sub; timeout = max(0.01, deadline - time())).data)))
+                        push!(replies, JSON.parse(String(NATS.next_msg(sub; timeout = max(0.01, deadline - time())).data)))
                     end
                     return replies
                 finally
@@ -2651,7 +2651,7 @@ with_nats() do url
             try
                 first = wait_ready(events)
                 @test first[1] == 1
-                first_data = JSON3.read(match(r"^CONNECT (.*)$", first[2]).captures[1])
+                first_data = JSON.parse(match(r"^CONNECT (.*)$", first[2]).captures[1])
                 @test first_data.jwt == "jwt-1"
                 @test first[3] == "PING"
 
@@ -2661,7 +2661,7 @@ with_nats() do url
                 @test wait_ready(disconnected, 2) isa NATS.AuthenticationExpiredError
                 second = wait_ready(events, 2)
                 @test second[1] == 2
-                second_data = JSON3.read(match(r"^CONNECT (.*)$", second[2]).captures[1])
+                second_data = JSON.parse(match(r"^CONNECT (.*)$", second[2]).captures[1])
                 @test second_data.jwt == "jwt-2"
                 @test second[3] == "PING"
                 @test jwt_calls[] == 2
@@ -5507,7 +5507,7 @@ with_nats(tag = "2.14.2") do url
             @test c_cfg["priority_timeout"] == 5_000_000_000
             @test c_cfg["priority_groups"] == ["A"]
 
-            pull_body = JSON3.read(JetStream.next_request_body(
+            pull_body = JSON.parse(JetStream.next_request_body(
                 batch = 2,
                 expires_ns = 1_000_000_000,
                 max_bytes = 1024,

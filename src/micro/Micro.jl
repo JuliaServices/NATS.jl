@@ -1,7 +1,7 @@
 module Micro
 
 import ..NATS
-using JSON3
+using JSON
 using Random
 
 const DEFAULT_QUEUE_GROUP = "q"
@@ -287,7 +287,7 @@ function respond(request::ServiceRequest, response = nothing; headers::Vector{Pa
 end
 
 respond_json(request::ServiceRequest, response; kwargs...) =
-    respond(request, JSON3.write(response); kwargs...)
+    respond(request, JSON.json(response); kwargs...)
 
 function respond_error(request::ServiceRequest, code::AbstractString, description::AbstractString, response = nothing; headers::Vector{Pair{String,String}} = Pair{String,String}[])
     isempty(code) && throw(ArgumentError("service error code is required"))
@@ -441,7 +441,7 @@ end
 function add_monitor!(service::Service, verb::AbstractString, subject::AbstractString, response)
     sub = NATS.subscribe(msg -> begin
         req = ServiceRequest(service, nothing, msg, nothing)
-        respond(req, JSON3.write(response()))
+        respond(req, JSON.json(response()))
     end, service.connection, subject)
     push!(service.verb_subscriptions, sub)
     return sub

@@ -598,7 +598,7 @@ function connect_payload(options::Options, url::ServerURL, info::ServerInfo, sec
     password === nothing || (data["pass"] = password)
     token === nothing || (data["auth_token"] = token)
     add_auth_fields!(data, options, info)
-    return Vector{UInt8}(codeunits("CONNECT $(JSON3.write(data))\r\n"))
+    return Vector{UInt8}(codeunits("CONNECT $(JSON.json(data))\r\n"))
 end
 
 function connection_status(conn::Connection)
