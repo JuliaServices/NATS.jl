@@ -6712,11 +6712,12 @@ with_nats_container() do first_container, first_url, first_port
                 @test [NATS.payload(NATS.next_msg(auto_sub; timeout = 2)) for _ in 1:2] == ["auto-3", "auto-4"]
                 @test wait_ready(auto_status) == NATS.SUBSCRIPTION_CLOSED
                 @test_throws NATS.MaxMessagesError NATS.next_msg(auto_sub; timeout = 0.1)
+
+                NATS.publish(conn, "natsjl.reconnect", "after")
+                msg = NATS.next_msg(sub; timeout = 2)
+                @test NATS.payload(msg) == "after"
             end
 
-            NATS.publish(conn, "natsjl.reconnect", "after")
-            msg = NATS.next_msg(sub; timeout = 2)
-            @test NATS.payload(msg) == "after"
             NATS.close(conn)
             @test wait_ready(closed) == NATS.CLOSED
         finally
