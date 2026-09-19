@@ -271,7 +271,7 @@ function ping(service::Service)
 end
 
 data(request::ServiceRequest) = request.msg.data
-payload(request::ServiceRequest) = String(request.msg.data)
+payload(request::ServiceRequest) = NATS.payload(request.msg)
 headers(request::ServiceRequest) = request.msg.headers
 subject(request::ServiceRequest) = request.msg.subject
 reply(request::ServiceRequest) = request.msg.reply
