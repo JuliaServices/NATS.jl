@@ -29,6 +29,18 @@ $JWT_USER_SEED
 ------END USER NKEY SEED------
 """
 
+@testset "payload reads preserve message bytes" begin
+    for data in (UInt8[], collect(codeunits("hello")), collect(codeunits("λ🌍")), UInt8[0x00, 0xff])
+        original = copy(data)
+        msg = NATS.Msg("payload", 0, nothing, Pair{String,String}[], data, 200, "")
+        first = NATS.payload(msg)
+        @test codeunits(first) == original
+        @test NATS.payload(msg) == first
+        @test msg.data == original
+        @test data == original
+    end
+end
+
 @testset "connected server metadata accessors" begin
     server = NATS.parse_server_url("nats://metadata.example:4222")
     conn = NATS.new_connection(
@@ -2282,7 +2294,10 @@ with_nats() do url
 
             group = NATS.Micro.add_group(first(services), "numbers")
             NATS.Micro.add_endpoint!(group, "Increment") do req
-                NATS.Micro.respond(req, string(parse(Int, NATS.Micro.payload(req)) + 1))
+                text = NATS.Micro.payload(req)
+                @test NATS.Micro.payload(req) == text
+                @test NATS.Micro.data(req) == codeunits(text)
+                NATS.Micro.respond(req, string(parse(Int, text) + 1))
             end
             inc = NATS.request(conn, "numbers.Increment", "3"; timeout = 2)
             @test NATS.payload(inc) == "4"
