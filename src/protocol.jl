@@ -59,13 +59,17 @@ Return the message payload as text without changing its stored bytes.
 payload(msg::Msg) = String(copy(msg.data))
 reply_subject(msg::Msg) = msg.reply
 
-function header(msg::Msg, key::AbstractString, default = nothing)
-    needle = lowercase(String(key))
-    for (k, v) in msg.headers
-        lowercase(k) == needle && return v
+header_key_equal(a::AbstractString, b::AbstractString) =
+    length(a) == length(b) && all(lowercase(x) == lowercase(y) for (x, y) in zip(a, b))
+
+function header_value(headers::Vector{Pair{String,String}}, key::AbstractString, default = nothing)
+    for (k, v) in headers
+        header_key_equal(k, key) && return v
     end
     return default
 end
+
+header(msg::Msg, key::AbstractString, default = nothing) = header_value(msg.headers, key, default)
 
 function readline_crlf(io)::String
     bytes = UInt8[]
