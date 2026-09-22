@@ -1890,6 +1890,7 @@ function reconnect_attempt!(conn::Connection, server::ServerURL)
         try
             lock(conn.lock)
             try
+                conn.status == CLOSED && throw(ConnectionClosedError("connection is closed"))
                 conn.url = server
                 conn.io = io
                 conn.info = info

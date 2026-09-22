@@ -6188,6 +6188,46 @@ with_jwt_nats() do dir, url
 end
 
 with_nats_container() do _container, url, port
+    @testset "close during reconnect handshake stays closed" begin
+        entered = Channel{Nothing}(1)
+        release = Channel{Nothing}(1)
+        calls = Ref(0)
+        token_cb = function ()
+            calls[] += 1
+            if calls[] == 2
+                put!(entered, nothing)
+                take!(release)
+            end
+            return "local-test-token"
+        end
+        conn = NATS.connect(url; token_cb, ping_interval = 0,
+            reconnect_wait = 0, reconnect_jitter = 0)
+        old_io = conn.io
+        attempt = @async try
+            NATS.force_reconnect(conn; timeout = 5)
+        catch err
+            err
+        end
+        try
+            wait_ready(entered, 5)
+            reconnect_task = conn.reconnect_task
+            NATS.close(conn)
+            @test NATS.is_closed(conn)
+            put!(release, nothing)
+            @test timedwait(() -> istaskdone(reconnect_task), 5) == :ok
+            wait(reconnect_task)
+            @test NATS.is_closed(conn)
+            @test conn.io === old_io
+            @test !isopen(conn.io)
+            @test NATS.stats(conn).reconnects == 0
+            @test timedwait(() -> istaskdone(attempt), 5) == :ok
+            @test fetch(attempt) isa NATS.ConnectionClosedError
+        finally
+            close(release)
+            NATS.close(conn)
+        end
+    end
+
     @testset "force reconnect resubscribes" begin
         disconnected = Channel{Any}(1)
         reconnected = Channel{Any}(1)
