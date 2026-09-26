@@ -996,15 +996,13 @@ function flush_write_buffer!(conn::Connection)
 end
 
 function close_after_terminal_error!(conn::Connection, err; expected_io = nothing)
-    expected_io === nothing && notify_error!(conn, err)
     local io
     lock(conn.write_lock)
     try
         lock(conn.lock)
         try
-            if expected_io !== nothing
-                (conn.io === expected_io && conn.status != CLOSED && conn.status != RECONNECTING) || return nothing
-            end
+            expected_io === nothing || is_current_transport(conn, expected_io) || return nothing
+            notify_error!(conn, err)
             io = conn.io
             set_connection_status_locked!(conn, CLOSED)
             empty!(conn.write_buffer)
@@ -1016,7 +1014,6 @@ function close_after_terminal_error!(conn::Connection, err; expected_io = nothin
     finally
         unlock(conn.write_lock)
     end
-    expected_io === nothing || notify_error!(conn, err)
     isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
     close_subscriptions!(conn; err)
     try close(io) catch end
@@ -1026,20 +1023,15 @@ end
 
 close_after_write_error!(conn::Connection, err) = close_after_terminal_error!(conn, err)
 
-function send_frame(conn::Connection, frame::Vector{UInt8}; timeout::Union{Nothing, Real} = nothing, operation::AbstractString = "write", allow_draining::Bool = false, buffer_on_reconnect::Bool = false, expected_io = nothing)
+function send_frame(conn::Connection, frame::Vector{UInt8}; timeout::Union{Nothing, Real} = nothing, operation::AbstractString = "write", allow_draining::Bool = false, buffer_on_reconnect::Bool = false)
     while true
-        # A protocol reply belongs to its reader's transport and must not wait
-        # for, or retry on, a replacement connection.
-        if expected_io === nothing
-            if buffer_on_reconnect && enqueue_reconnect_frame!(conn, frame)
-                return nothing
-            end
-            wait_connected(conn; timeout, operation, allow_draining)
+        if buffer_on_reconnect && enqueue_reconnect_frame!(conn, frame)
+            return nothing
         end
+        wait_connected(conn; timeout, operation, allow_draining)
         local write_error = nothing
         lock(conn.write_lock)
         try
-            (expected_io === nothing || conn.io === expected_io) || return nothing
             status = connection_status(conn)
             (status == CONNECTED || (allow_draining && status == DRAINING)) ||
                 throw(ConnectionClosedError("cannot write while connection is not connected"))
@@ -1050,7 +1042,6 @@ function send_frame(conn::Connection, frame::Vector{UInt8}; timeout::Union{Nothi
         finally
             unlock(conn.write_lock)
         end
-        expected_io === nothing || throw(write_error)
         if connection_status(conn) == CONNECTED
             if conn.options.reconnect_on_flusher_error
                 if conn.options.allow_reconnect
@@ -1552,19 +1543,21 @@ function close_subscriptions!(conn::Connection; err::Exception = ConnectionClose
     return nothing
 end
 
-function reader_loop(conn::Connection, io = conn.io)
+# A reader task serves one transport. Once reconnect or close retires it, that
+# reader must not reply, record PONGs, or change the connection state.
+is_current_transport(conn::Connection, io) =
+    conn.io === io && conn.status != CLOSED && conn.status != RECONNECTING
+
+function reader_loop(conn::Connection, io)
     reader = io isa Union{Reseau.TCP.Conn, Reseau.TLS.Conn} ? ProtocolReader(io) : io
     try
-        while conn.io === io && conn.status != CLOSED && conn.status != RECONNECTING
+        while true
             msg = read_protocol_message(reader)
-            # A read can finish after reconnect has retired its transport.
-            (conn.io === io && conn.status != CLOSED && conn.status != RECONNECTING) || return nothing
+            is_current_transport(conn, io) || return nothing
             handle_protocol_message(conn, msg, io)
         end
     catch err
-        conn.io === io || return nothing
-        conn.status == CLOSED && return nothing
-        conn.status == RECONNECTING && return nothing
+        # Both calls are no-ops once this transport has been retired.
         if conn.options.allow_reconnect && conn.status != DRAINING
             start_reconnect!(conn, err; expected_io = io)
         else
@@ -2061,15 +2054,22 @@ function handle_protocol_message(conn::Connection, ::Ok)
     return nothing
 end
 
-function handle_protocol_message(conn::Connection, ::Ping, io = conn.io)
-    send_frame(conn, pong_frame(); expected_io = io)
+function handle_protocol_message(conn::Connection, ::Ping, io)
+    lock(conn.write_lock)
+    try
+        # Reply on the transport that sent the PING, including while draining.
+        lock(() -> is_current_transport(conn, io), conn.lock) || return nothing
+        queue_frame_locked!(conn, pong_frame())
+    finally
+        unlock(conn.write_lock)
+    end
     return nothing
 end
 
-function handle_protocol_message(conn::Connection, ::Pong, io = conn.io)
+function handle_protocol_message(conn::Connection, ::Pong, io)
     lock(conn.lock)
     try
-        (conn.io === io && conn.status != CLOSED && conn.status != RECONNECTING) || return nothing
+        is_current_transport(conn, io) || return nothing
         conn.pings_out = 0
         put!(conn.pongs, nothing)
     finally
@@ -2241,7 +2241,7 @@ function take_slow_consumer_error!(sub::Subscription)
     end
 end
 
-function handle_protocol_message(conn::Connection, err::Err, io = conn.io)
+function handle_protocol_message(conn::Connection, err::Err, io)
     classified = classify_server_error(err.message)
     if server_error_is_transient(classified)
         classified isa PermissionViolationError && route_subscription_permission_error!(conn, classified)

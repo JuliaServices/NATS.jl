@@ -67,8 +67,8 @@ function header(msg::Msg, key::AbstractString, default = nothing)
     return default
 end
 
-# Read-ahead storage belongs to one established TCP/TLS reader. Payload reads
-# copy buffered bytes into their own vector and read the remainder directly.
+# Read-ahead buffer for a TCP/TLS transport, owned by its reader task. Payload
+# reads copy any buffered prefix, then read the rest from `io` directly.
 mutable struct ProtocolReader{T}
     io::T
     buffer::Vector{UInt8}
