@@ -315,6 +315,11 @@ stored = JetStream.get_info(objects, "daily-report.json")
 JetStream.put_file(objects, "build/report.pdf"; name = "reports/daily.pdf")
 JetStream.get_file(objects, "reports/daily.pdf", "downloaded-report.pdf")
 
+# Stream into caller-owned IO; a failure can leave partial, unverified output.
+open("downloaded-report.partial", "w") do output
+    JetStream.get_to(objects, "reports/daily.pdf", output; batch_size=32)
+end
+
 for object in JetStream.list(objects)
     @info "object" name = object.name size = object.size
 end
