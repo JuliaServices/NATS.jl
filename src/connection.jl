@@ -995,12 +995,17 @@ function flush_write_buffer!(conn::Connection)
     return nothing
 end
 
-function close_after_terminal_error!(conn::Connection, err)
-    notify_error!(conn, err)
+function close_after_terminal_error!(conn::Connection, err; expected_io = nothing)
+    expected_io === nothing && notify_error!(conn, err)
+    local io
     lock(conn.write_lock)
     try
         lock(conn.lock)
         try
+            if expected_io !== nothing
+                (conn.io === expected_io && conn.status != CLOSED && conn.status != RECONNECTING) || return nothing
+            end
+            io = conn.io
             set_connection_status_locked!(conn, CLOSED)
             empty!(conn.write_buffer)
             empty!(conn.pending_frames)
@@ -1011,24 +1016,30 @@ function close_after_terminal_error!(conn::Connection, err)
     finally
         unlock(conn.write_lock)
     end
+    expected_io === nothing || notify_error!(conn, err)
     isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
     close_subscriptions!(conn; err)
-    try close(conn.io) catch end
+    try close(io) catch end
     notify_closed!(conn)
     return nothing
 end
 
 close_after_write_error!(conn::Connection, err) = close_after_terminal_error!(conn, err)
 
-function send_frame(conn::Connection, frame::Vector{UInt8}; timeout::Union{Nothing, Real} = nothing, operation::AbstractString = "write", allow_draining::Bool = false, buffer_on_reconnect::Bool = false)
+function send_frame(conn::Connection, frame::Vector{UInt8}; timeout::Union{Nothing, Real} = nothing, operation::AbstractString = "write", allow_draining::Bool = false, buffer_on_reconnect::Bool = false, expected_io = nothing)
     while true
-        if buffer_on_reconnect && enqueue_reconnect_frame!(conn, frame)
-            return nothing
+        # A protocol reply belongs to its reader's transport and must not wait
+        # for, or retry on, a replacement connection.
+        if expected_io === nothing
+            if buffer_on_reconnect && enqueue_reconnect_frame!(conn, frame)
+                return nothing
+            end
+            wait_connected(conn; timeout, operation, allow_draining)
         end
-        wait_connected(conn; timeout, operation, allow_draining)
         local write_error = nothing
         lock(conn.write_lock)
         try
+            (expected_io === nothing || conn.io === expected_io) || return nothing
             status = connection_status(conn)
             (status == CONNECTED || (allow_draining && status == DRAINING)) ||
                 throw(ConnectionClosedError("cannot write while connection is not connected"))
@@ -1039,6 +1050,7 @@ function send_frame(conn::Connection, frame::Vector{UInt8}; timeout::Union{Nothi
         finally
             unlock(conn.write_lock)
         end
+        expected_io === nothing || throw(write_error)
         if connection_status(conn) == CONNECTED
             if conn.options.reconnect_on_flusher_error
                 if conn.options.allow_reconnect
@@ -1080,11 +1092,11 @@ server_error_should_reconnect(err) =
     err isa AuthenticationExpiredError ||
     err isa AccountAuthenticationExpiredError
 
-function handle_terminal_server_error!(conn::Connection, err)
+function handle_terminal_server_error!(conn::Connection, err; expected_io = nothing)
     if server_error_should_reconnect(err) && conn.options.allow_reconnect && connection_status(conn) == CONNECTED
-        start_reconnect!(conn, err)
+        start_reconnect!(conn, err; expected_io)
     else
-        close_after_terminal_error!(conn, err)
+        close_after_terminal_error!(conn, err; expected_io)
     end
     return nothing
 end
@@ -1455,7 +1467,7 @@ function init_connection(url::ServerURL, options::Options)
         conn = new_connection(server, servers, options, io, info, CONNECTING; connected_once = true)
         apply_discovered_servers!(conn, server, info; notify = false)
         set_connection_status!(conn, CONNECTED)
-        conn.reader_task = errormonitor(@async reader_loop(conn))
+        conn.reader_task = errormonitor(@async reader_loop(conn, io))
         start_ping_loop!(conn)
         notify_connected!(conn)
         return conn
@@ -1540,19 +1552,23 @@ function close_subscriptions!(conn::Connection; err::Exception = ConnectionClose
     return nothing
 end
 
-function reader_loop(conn::Connection)
+function reader_loop(conn::Connection, io = conn.io)
+    reader = io isa Union{Reseau.TCP.Conn, Reseau.TLS.Conn} ? ProtocolReader(io) : io
     try
-        while conn.status != CLOSED
-            msg = read_protocol_message(conn.io)
-            handle_protocol_message(conn, msg)
+        while conn.io === io && conn.status != CLOSED && conn.status != RECONNECTING
+            msg = read_protocol_message(reader)
+            # A read can finish after reconnect has retired its transport.
+            (conn.io === io && conn.status != CLOSED && conn.status != RECONNECTING) || return nothing
+            handle_protocol_message(conn, msg, io)
         end
     catch err
+        conn.io === io || return nothing
         conn.status == CLOSED && return nothing
         conn.status == RECONNECTING && return nothing
         if conn.options.allow_reconnect && conn.status != DRAINING
-            start_reconnect!(conn, err)
+            start_reconnect!(conn, err; expected_io = io)
         else
-            close_after_terminal_error!(conn, err)
+            close_after_terminal_error!(conn, err; expected_io = io)
         end
     end
     return nothing
@@ -1574,13 +1590,16 @@ function force_reconnect(conn::Connection; timeout::Union{Nothing, Real} = conn.
     return nothing
 end
 
-function start_reconnect!(conn::Connection, err)
+function start_reconnect!(conn::Connection, err; expected_io = nothing)
     should_start = false
+    local io
     lock(conn.write_lock)
     try
         lock(conn.lock)
         try
+            (expected_io === nothing || conn.io === expected_io) || return nothing
             if conn.status == CONNECTED || conn.status == CONNECTING
+                io = conn.io
                 set_connection_status_locked!(conn, RECONNECTING)
                 empty!(conn.write_buffer)
                 for sub in values(conn.subscriptions)
@@ -1608,7 +1627,7 @@ function start_reconnect!(conn::Connection, err)
         take!(conn.pongs)
     end
     reset_pings_out!(conn)
-    try close(conn.io) catch end
+    try close(io) catch end
     conn.reconnect_task = errormonitor(@async reconnect_loop(conn, err))
     return nothing
 end
@@ -1912,7 +1931,7 @@ function reconnect_attempt!(conn::Connection, server::ServerURL)
                         conn.connected_once = true
                         set_connection_status_locked!(conn, CONNECTED)
                         conn.reconnect_task = nothing
-                        conn.reader_task = errormonitor(@async reader_loop(conn))
+                        conn.reader_task = errormonitor(@async reader_loop(conn, io))
                         break
                     end
                 finally
@@ -2036,18 +2055,26 @@ function reconnect_loop(conn::Connection, initial_error = nothing)
     end
 end
 
+handle_protocol_message(conn::Connection, msg, io) = handle_protocol_message(conn, msg)
+
 function handle_protocol_message(conn::Connection, ::Ok)
     return nothing
 end
 
-function handle_protocol_message(conn::Connection, ::Ping)
-    send_frame(conn, pong_frame())
+function handle_protocol_message(conn::Connection, ::Ping, io = conn.io)
+    send_frame(conn, pong_frame(); expected_io = io)
     return nothing
 end
 
-function handle_protocol_message(conn::Connection, ::Pong)
-    reset_pings_out!(conn)
-    put!(conn.pongs, nothing)
+function handle_protocol_message(conn::Connection, ::Pong, io = conn.io)
+    lock(conn.lock)
+    try
+        (conn.io === io && conn.status != CLOSED && conn.status != RECONNECTING) || return nothing
+        conn.pings_out = 0
+        put!(conn.pongs, nothing)
+    finally
+        unlock(conn.lock)
+    end
     return nothing
 end
 
@@ -2214,13 +2241,13 @@ function take_slow_consumer_error!(sub::Subscription)
     end
 end
 
-function handle_protocol_message(conn::Connection, err::Err)
+function handle_protocol_message(conn::Connection, err::Err, io = conn.io)
     classified = classify_server_error(err.message)
     if server_error_is_transient(classified)
         classified isa PermissionViolationError && route_subscription_permission_error!(conn, classified)
         notify_error!(conn, classified)
     else
-        handle_terminal_server_error!(conn, classified)
+        handle_terminal_server_error!(conn, classified; expected_io = io)
     end
     return nothing
 end

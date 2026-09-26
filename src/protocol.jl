@@ -67,6 +67,40 @@ function header(msg::Msg, key::AbstractString, default = nothing)
     return default
 end
 
+# Read-ahead storage belongs to one established TCP/TLS reader. Payload reads
+# copy buffered bytes into their own vector and read the remainder directly.
+mutable struct ProtocolReader{T}
+    io::T
+    buffer::Vector{UInt8}
+    next::Int
+    stop::Int
+end
+
+ProtocolReader(io) = ProtocolReader(io, Vector{UInt8}(undef, 16 * 1024), 1, 0)
+
+function Base.read(reader::ProtocolReader, ::Type{UInt8})
+    if reader.next > reader.stop
+        reader.stop = readbytes!(reader.io, reader.buffer; all = false)
+        reader.next = 1
+        reader.stop == 0 && throw(EOFError())
+    end
+    byte = reader.buffer[reader.next]
+    reader.next += 1
+    return byte
+end
+
+function Base.read(reader::ProtocolReader, n::Integer)
+    bytes = Vector{UInt8}(undef, Int(n))
+    copied = min(length(bytes), reader.stop - reader.next + 1)
+    copyto!(bytes, 1, reader.buffer, reader.next, copied)
+    reader.next += copied
+    if copied < length(bytes)
+        received = readbytes!(reader.io, @view(bytes[(copied + 1):end]))
+        resize!(bytes, copied + received)
+    end
+    return bytes
+end
+
 function readline_crlf(io)::String
     bytes = UInt8[]
     while true
