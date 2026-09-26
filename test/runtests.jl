@@ -1158,6 +1158,8 @@ function wait_port_closed(port::Integer, timeout::Real = 5)
     return nothing
 end
 
+include("protocol_reader.jl")
+
 @testset "protocol serialization" begin
     @test String(NATS.pub_frame("foo", "bar")) == "PUB foo 3\r\nbar\r\n"
     valid_header_key = "!#\$%&'*+-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ^_`abcdefghijklmnopqrstuvwxyz|~"
@@ -1770,6 +1772,14 @@ end
 end
 
 with_nats() do url
+    @testset "buffered TCP delivery" begin
+        conn = NATS.connect(url)
+        try
+            test_buffered_delivery(conn, "natsjl.buffered.tcp")
+        finally
+            NATS.close(conn)
+        end
+    end
     @testset "core pub/sub request/reply" begin
         conn = NATS.connect(url)
         try
@@ -5852,6 +5862,7 @@ with_tls_nats() do certs, url
             msg = NATS.next_msg(sub; timeout = 2)
             @test NATS.payload(msg) == "secure"
             @test NATS.tls_required(conn) || NATS.tls_available(conn)
+            test_buffered_delivery(conn, "natsjl.buffered.tls")
         finally
             NATS.close(conn)
         end
