@@ -4335,18 +4335,6 @@ function watcher_entry(kv::KeyValue, msg::NATS.Msg)
     ), meta.num_pending
 end
 
-function finish_watcher!(watcher::KeyValueWatcher)
-    lock(watcher.lock)
-    try
-        watcher.closed = true
-        isopen(watcher.updates) && close(watcher.updates)
-        isopen(watcher.errors) && close(watcher.errors)
-    finally
-        unlock(watcher.lock)
-    end
-    return nothing
-end
-
 function watcher_loop(watcher::KeyValueWatcher, initial_pending::UInt64, updates_only::Bool, ignore_deletes::Bool)
     init_done = updates_only || initial_pending == 0
     received = UInt64(0)
@@ -4373,7 +4361,7 @@ function watcher_loop(watcher::KeyValueWatcher, initial_pending::UInt64, updates
             try put!(watcher.errors, err) catch end
         end
     finally
-        finish_watcher!(watcher)
+        close(watcher)
     end
     return nothing
 end
@@ -5267,18 +5255,6 @@ function seal(store::ObjectStore; timeout::Real = store.connection.options.reque
     return nothing
 end
 
-function finish_object_watcher!(watcher::ObjectWatcher)
-    lock(watcher.lock)
-    try
-        watcher.closed = true
-        isopen(watcher.updates) && close(watcher.updates)
-        isopen(watcher.errors) && close(watcher.errors)
-    finally
-        unlock(watcher.lock)
-    end
-    return nothing
-end
-
 function object_watcher_loop(watcher::ObjectWatcher, initial_pending::UInt64, updates_only::Bool, ignore_deletes::Bool)
     init_done = updates_only || initial_pending == 0
     received = UInt64(0)
@@ -5321,7 +5297,7 @@ function object_watcher_loop(watcher::ObjectWatcher, initial_pending::UInt64, up
             try put!(watcher.errors, err) catch end
         end
     finally
-        finish_object_watcher!(watcher)
+        close(watcher)
     end
     return nothing
 end
