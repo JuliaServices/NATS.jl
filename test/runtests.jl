@@ -6753,3 +6753,6 @@ with_nats_container() do first_container, first_url, first_port
         end
     end
 end
+
+include("object_download.jl")
+with_nats(ObjectDownloadTests.runtests)
