@@ -6755,4 +6755,5 @@ with_nats_container() do first_container, first_url, first_port
 end
 
 include("object_download.jl")
+include("watcher_cleanup.jl")
 with_nats(ObjectDownloadTests.runtests)
