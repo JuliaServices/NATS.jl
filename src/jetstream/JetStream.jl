@@ -872,13 +872,8 @@ function raw_msg_from_stored(stream::AbstractString, stored)
     )
 end
 
-function header_value(headers::Vector{Pair{String,String}}, key::AbstractString, default = nothing)
-    needle = lowercase(String(key))
-    for (k, v) in headers
-        lowercase(k) == needle && return v
-    end
-    return default
-end
+header_value(headers::Vector{Pair{String,String}}, key::AbstractString, default = nothing) =
+    NATS.header_value(headers, key, default)
 
 function direct_msg_error(msg::NATS.Msg, subject::AbstractString)
     msg.status == 503 && throw(NATS.NoRespondersError(String(subject)))
@@ -3946,7 +3941,7 @@ end
 
 function kv_operation(headers::Vector{Pair{String,String}})
     for (k, v) in headers
-        lowercase(k) == lowercase(KV_OPERATION_HEADER) || continue
+        NATS.header_key_equal(k, KV_OPERATION_HEADER) || continue
         v == "DEL" && return :delete
         v == "PURGE" && return :purge
     end

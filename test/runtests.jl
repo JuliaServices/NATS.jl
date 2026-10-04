@@ -41,6 +41,28 @@ $JWT_USER_SEED
     end
 end
 
+@testset "header lookup preserves keys and order" begin
+    headers = ["Nats-Stream" => "first", "NATS-STREAM" => "second", "É" => "unicode"]
+    original = copy(headers)
+    msg = NATS.Msg("headers", 0, nothing, headers, UInt8[], 200, "")
+    for key in ("Nats-Stream", "nats-stream", SubString("_NATS-STREAM", 2))
+        @test NATS.header(msg, key) == "first"
+        @test NATS.JetStream.header_value(headers, key) == "first"
+    end
+    @test NATS.header(msg, "é") == "unicode"
+    @test NATS.header(msg, "absent") === nothing
+    sentinel = Ref(1)
+    @test NATS.header(msg, "absent", sentinel) === sentinel
+    @test NATS.JetStream.header_value(headers, "absent", sentinel) === sentinel
+    @test NATS.header_value(Pair{String,String}[], "absent", sentinel) === sentinel
+    @test headers == original
+    @test (@allocated NATS.header(msg, "Nats-Stream")) == 0
+    @test (@allocated NATS.JetStream.header_value(headers, "absent")) == 0
+    @test NATS.JetStream.kv_operation(["kv-operation" => "DEL"]) === :delete
+    @test NATS.JetStream.kv_operation(["Kv-Operation" => "PURGE"]) === :purge
+    @test NATS.JetStream.kv_operation(["KV-Operation" => "other", "kv-operation" => "DEL"]) === :delete
+end
+
 @testset "connected server metadata accessors" begin
     server = NATS.parse_server_url("nats://metadata.example:4222")
     conn = NATS.new_connection(
