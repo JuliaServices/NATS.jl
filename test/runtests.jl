@@ -41,6 +41,28 @@ $JWT_USER_SEED
     end
 end
 
+@testset "header lookup preserves keys and order" begin
+    headers = ["Nats-Stream" => "first", "NATS-STREAM" => "second", "É" => "unicode"]
+    original = copy(headers)
+    msg = NATS.Msg("headers", 0, nothing, headers, UInt8[], 200, "")
+    for key in ("Nats-Stream", "nats-stream", SubString("_NATS-STREAM", 2))
+        @test NATS.header(msg, key) == "first"
+        @test NATS.JetStream.header_value(headers, key) == "first"
+    end
+    @test NATS.header(msg, "é") == "unicode"
+    @test NATS.header(msg, "absent") === nothing
+    sentinel = Ref(1)
+    @test NATS.header(msg, "absent", sentinel) === sentinel
+    @test NATS.JetStream.header_value(headers, "absent", sentinel) === sentinel
+    @test NATS.header_value(Pair{String,String}[], "absent", sentinel) === sentinel
+    @test headers == original
+    @test (@allocated NATS.header(msg, "Nats-Stream")) == 0
+    @test (@allocated NATS.JetStream.header_value(headers, "absent")) == 0
+    @test NATS.JetStream.kv_operation(["kv-operation" => "DEL"]) === :delete
+    @test NATS.JetStream.kv_operation(["Kv-Operation" => "PURGE"]) === :purge
+    @test NATS.JetStream.kv_operation(["KV-Operation" => "other", "kv-operation" => "DEL"]) === :delete
+end
+
 @testset "connected server metadata accessors" begin
     server = NATS.parse_server_url("nats://metadata.example:4222")
     conn = NATS.new_connection(
@@ -1158,6 +1180,8 @@ function wait_port_closed(port::Integer, timeout::Real = 5)
     return nothing
 end
 
+include("protocol_reader.jl")
+
 @testset "protocol serialization" begin
     @test String(NATS.pub_frame("foo", "bar")) == "PUB foo 3\r\nbar\r\n"
     valid_header_key = "!#\$%&'*+-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ^_`abcdefghijklmnopqrstuvwxyz|~"
@@ -1770,6 +1794,14 @@ end
 end
 
 with_nats() do url
+    @testset "buffered TCP delivery" begin
+        conn = NATS.connect(url)
+        try
+            test_buffered_delivery(conn, "natsjl.buffered.tcp")
+        finally
+            NATS.close(conn)
+        end
+    end
     @testset "core pub/sub request/reply" begin
         conn = NATS.connect(url)
         try
@@ -5852,6 +5884,7 @@ with_tls_nats() do certs, url
             msg = NATS.next_msg(sub; timeout = 2)
             @test NATS.payload(msg) == "secure"
             @test NATS.tls_required(conn) || NATS.tls_available(conn)
+            test_buffered_delivery(conn, "natsjl.buffered.tls")
         finally
             NATS.close(conn)
         end
@@ -6782,3 +6815,7 @@ with_nats_container() do first_container, first_url, first_port
         end
     end
 end
+
+include("object_download.jl")
+include("watcher_cleanup.jl")
+with_nats(ObjectDownloadTests.runtests)

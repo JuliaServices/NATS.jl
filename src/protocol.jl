@@ -59,12 +59,50 @@ Return the message payload as text without changing its stored bytes.
 payload(msg::Msg) = String(copy(msg.data))
 reply_subject(msg::Msg) = msg.reply
 
-function header(msg::Msg, key::AbstractString, default = nothing)
-    needle = lowercase(String(key))
-    for (k, v) in msg.headers
-        lowercase(k) == needle && return v
+header_key_equal(a::AbstractString, b::AbstractString) =
+    length(a) == length(b) && all(lowercase(x) == lowercase(y) for (x, y) in zip(a, b))
+
+function header_value(headers::Vector{Pair{String,String}}, key::AbstractString, default = nothing)
+    for (k, v) in headers
+        header_key_equal(k, key) && return v
     end
     return default
+end
+
+header(msg::Msg, key::AbstractString, default = nothing) = header_value(msg.headers, key, default)
+
+# Read-ahead buffer for a TCP/TLS transport, owned by its reader task. Payload
+# reads copy any buffered prefix, then read the rest from `io` directly.
+mutable struct ProtocolReader{T}
+    io::T
+    buffer::Vector{UInt8}
+    next::Int
+    stop::Int
+end
+
+ProtocolReader(io) = ProtocolReader(io, Vector{UInt8}(undef, 16 * 1024), 1, 0)
+
+function Base.read(reader::ProtocolReader, ::Type{UInt8})
+    if reader.next > reader.stop
+        reader.stop = readbytes!(reader.io, reader.buffer; all = false)
+        reader.next = 1
+        reader.stop == 0 && throw(EOFError())
+    end
+    byte = reader.buffer[reader.next]
+    reader.next += 1
+    return byte
+end
+
+function Base.read(reader::ProtocolReader, n::Integer)
+    bytes = Vector{UInt8}(undef, Int(n))
+    copied = min(length(bytes), reader.stop - reader.next + 1)
+    copyto!(bytes, 1, reader.buffer, reader.next, copied)
+    reader.next += copied
+    if copied < length(bytes)
+        received = readbytes!(reader.io, @view(bytes[(copied + 1):end]))
+        resize!(bytes, copied + received)
+    end
+    return bytes
 end
 
 function readline_crlf(io)::String

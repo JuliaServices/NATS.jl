@@ -872,13 +872,8 @@ function raw_msg_from_stored(stream::AbstractString, stored)
     )
 end
 
-function header_value(headers::Vector{Pair{String,String}}, key::AbstractString, default = nothing)
-    needle = lowercase(String(key))
-    for (k, v) in headers
-        lowercase(k) == needle && return v
-    end
-    return default
-end
+header_value(headers::Vector{Pair{String,String}}, key::AbstractString, default = nothing) =
+    NATS.header_value(headers, key, default)
 
 function direct_msg_error(msg::NATS.Msg, subject::AbstractString)
     msg.status == 503 && throw(NATS.NoRespondersError(String(subject)))
@@ -3946,7 +3941,7 @@ end
 
 function kv_operation(headers::Vector{Pair{String,String}})
     for (k, v) in headers
-        lowercase(k) == lowercase(KV_OPERATION_HEADER) || continue
+        NATS.header_key_equal(k, KV_OPERATION_HEADER) || continue
         v == "DEL" && return :delete
         v == "PURGE" && return :purge
     end
@@ -4335,18 +4330,6 @@ function watcher_entry(kv::KeyValue, msg::NATS.Msg)
     ), meta.num_pending
 end
 
-function finish_watcher!(watcher::KeyValueWatcher)
-    lock(watcher.lock)
-    try
-        watcher.closed = true
-        isopen(watcher.updates) && close(watcher.updates)
-        isopen(watcher.errors) && close(watcher.errors)
-    finally
-        unlock(watcher.lock)
-    end
-    return nothing
-end
-
 function watcher_loop(watcher::KeyValueWatcher, initial_pending::UInt64, updates_only::Bool, ignore_deletes::Bool)
     init_done = updates_only || initial_pending == 0
     received = UInt64(0)
@@ -4373,7 +4356,7 @@ function watcher_loop(watcher::KeyValueWatcher, initial_pending::UInt64, updates
             try put!(watcher.errors, err) catch end
         end
     finally
-        finish_watcher!(watcher)
+        close(watcher)
     end
     return nothing
 end
@@ -4920,15 +4903,26 @@ put(store::ObjectStore, name::AbstractString, data; kwargs...) =
 put_string(store::ObjectStore, name::AbstractString, data::AbstractString; kwargs...) =
     put(store, name, data; kwargs...)
 
-function get_bytes(store::ObjectStore, name::AbstractString; show_deleted::Bool = false, timeout::Real = store.connection.options.request_timeout)
-    info = get_info(store, name; show_deleted, timeout)
-    info.deleted && return UInt8[]
-    isempty(info.nuid) && throw(BadObjectMetaError(info.name))
-    if info.link !== nothing
+function resolve_object(store::ObjectStore, name::AbstractString; show_deleted::Bool, timeout::Real)
+    visited = nothing
+    while true
+        info = get_info(store, name; show_deleted, timeout)
+        info.deleted && return store, info
+        isempty(info.nuid) && throw(BadObjectMetaError(info.name))
+        info.link === nothing && return store, info
+        visited === nothing && (visited = Set{Tuple{String,String}}())
+        key = (store.bucket, String(name))
+        key in visited && throw(BadObjectMetaError(String(name)))
+        push!(visited, key)
         info.link.name === nothing && throw(JetStreamError(400, 0, "cannot get bucket link as object"))
-        linked_store = info.link.bucket == store.bucket ? store : object_store(store.connection, info.link.bucket; timeout, api_prefix = store.api_prefix)
-        return get_bytes(linked_store, info.link.name; show_deleted, timeout)
+        store = info.link.bucket == store.bucket ? store : object_store(store.connection, info.link.bucket; timeout, api_prefix = store.api_prefix)
+        name = info.link.name
     end
+end
+
+function get_bytes(store::ObjectStore, name::AbstractString; show_deleted::Bool = false, timeout::Real = store.connection.options.request_timeout)
+    store, info = resolve_object(store, name; show_deleted, timeout)
+    info.deleted && return UInt8[]
     out = UInt8[]
     next_seq = UInt64(1)
     chunk_subject = object_chunk_subject(store.bucket, info.nuid)
@@ -4943,6 +4937,99 @@ function get_bytes(store::ObjectStore, name::AbstractString; show_deleted::Bool 
         sha256(out) == expected_digest || throw(JetStreamError(500, 0, "object digest mismatch"))
     end
     return out
+end
+
+"""
+    NATS.JetStream.get_to(store, name, output::IO; batch_size=32, show_deleted=false, timeout)
+
+Stream an object into caller-owned `output` and return its resolved `ObjectInfo`
+after checking its chunk count, size, and optional SHA-256 digest. Object links
+are followed; bucket links and link cycles are rejected. A deleted object with
+`show_deleted=true` writes nothing.
+
+An ephemeral pull consumer receives raw chunks in batches, without Base64 or a
+whole-object buffer. `batch_size` bounds the number of chunks retained per batch;
+memory also depends on their sizes and the connection's transport buffers.
+This requires permission to create, inspect, pull from, and delete a consumer on
+the bucket's stream. Cleanup is attempted for known created consumers; a
+five-minute inactivity timeout covers unconfirmed creation or failed cleanup.
+
+`timeout` applies to metadata, consumer setup, and each batch request; consumer
+deletion uses the connection’s request timeout. Output writes are synchronous and
+must make progress; the function does not close or flush `output`. An error can
+leave a partial, unverified object in the destination. Use a temporary destination
+when existing data must survive download or digest errors. No data is replayed
+after a failed batch or output write.
+"""
+function get_to(store::ObjectStore, name::AbstractString, output::IO;
+                batch_size::Int=32, show_deleted::Bool=false,
+                timeout::Real=store.connection.options.request_timeout)
+    batch_size > 0 || throw(ArgumentError("batch_size must be positive"))
+    timeout = Float64(timeout)
+    isfinite(timeout) && timeout > 0 || throw(ArgumentError("timeout must be positive and finite"))
+    store, info = resolve_object(store, name; show_deleted, timeout)
+    info.deleted && return info
+    digest = isempty(info.digest) ? nothing : decode_object_digest(info.digest)
+    hash = SHA.SHA256_CTX()
+    if info.chunks == 0
+        info.size == 0 || throw(JetStreamError(500, 0, "object size mismatch"))
+        digest === nothing || SHA.digest!(hash) == digest || throw(JetStreamError(500, 0, "object digest mismatch"))
+        return info
+    end
+    subject = object_chunk_subject(store.bucket, info.nuid)
+    config = ConsumerConfig(filter_subject=subject, deliver_policy="all", ack_policy="none",
+        inactive_threshold=300_000_000_000, replicas=1, memory_storage=true)
+    consumer = pull_subscribe(store.connection, store.stream, config;
+        channel_size=1, timeout, api_prefix=store.api_prefix)
+    complete = false
+    count = UInt64(0)
+    size = UInt64(0)
+    last_sequence = UInt64(0)
+    try
+        while count < info.chunks
+            wanted = Int(min(UInt64(batch_size), UInt64(info.chunks) - count))
+            messages = fetch(consumer; batch=wanted, no_wait=true, timeout)
+            length(messages) == wanted || throw(JetStreamError(500, 0, "object chunk count mismatch"))
+            for message in messages
+                meta = metadata(message)
+                if message.subject != subject || meta.stream != store.stream ||
+                   meta.consumer != consumer.consumer || meta.sequence.consumer != count + 1 ||
+                   meta.sequence.stream <= last_sequence
+                    throw(JetStreamError(500, 0, "object chunk sequence mismatch"))
+                end
+                count + 1 == info.chunks && meta.num_pending != 0 &&
+                    throw(JetStreamError(500, 0, "object chunk count mismatch"))
+                data = message.data
+                UInt64(length(data)) <= info.size - size || throw(JetStreamError(500, 0, "object size mismatch"))
+                offset = 1
+                while offset <= length(data)
+                    written = write(output, @view data[offset:end])
+                    written isa Integer && 0 < written <= length(data) - offset + 1 ||
+                        throw(Base.IOError("object output returned an invalid byte count", 0))
+                    offset += written
+                end
+                SHA.update!(hash, data)
+                count += 1
+                size += UInt64(length(data))
+                last_sequence = meta.sequence.stream
+            end
+        end
+        size == info.size || throw(JetStreamError(500, 0, "object size mismatch"))
+        digest === nothing || SHA.digest!(hash) == digest || throw(JetStreamError(500, 0, "object digest mismatch"))
+        complete = true
+        return info
+    finally
+        if complete
+            close(consumer)
+        else
+            try
+                close(consumer)
+            catch
+                # Preserve the download/output failure. The server also expires
+                # an abandoned ephemeral consumer after its inactivity timeout.
+            end
+        end
+    end
 end
 
 get_string(store::ObjectStore, name::AbstractString; kwargs...) =
@@ -5163,18 +5250,6 @@ function seal(store::ObjectStore; timeout::Real = store.connection.options.reque
     return nothing
 end
 
-function finish_object_watcher!(watcher::ObjectWatcher)
-    lock(watcher.lock)
-    try
-        watcher.closed = true
-        isopen(watcher.updates) && close(watcher.updates)
-        isopen(watcher.errors) && close(watcher.errors)
-    finally
-        unlock(watcher.lock)
-    end
-    return nothing
-end
-
 function object_watcher_loop(watcher::ObjectWatcher, initial_pending::UInt64, updates_only::Bool, ignore_deletes::Bool)
     init_done = updates_only || initial_pending == 0
     received = UInt64(0)
@@ -5217,7 +5292,7 @@ function object_watcher_loop(watcher::ObjectWatcher, initial_pending::UInt64, up
             try put!(watcher.errors, err) catch end
         end
     finally
-        finish_object_watcher!(watcher)
+        close(watcher)
     end
     return nothing
 end
