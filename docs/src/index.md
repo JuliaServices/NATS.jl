@@ -860,6 +860,32 @@ deleted = JetStream.get_info(objects, "latest-report.json"; show_deleted = true)
 JetStream.delete_object_store(conn, "ARTIFACTS")
 ```
 
+Use `JetStream.get_to` to download into an open file, socket, or other `IO` without
+materializing the whole object:
+
+```julia
+open("report.partial", "w") do output
+    info = JetStream.get_to(objects, "report.json", output; batch_size=32, timeout=5)
+end
+```
+
+`get_to` returns the resolved `ObjectInfo` after validating chunk count, size, and
+any advertised SHA-256 digest. It follows object links and rejects link cycles
+and bucket links. `batch_size` limits the chunks requested at a time; memory use
+also depends on chunk sizes and transport buffers. The destination stays open
+and is not flushed. Writes must make progress. Failures may leave partial,
+unverified output, so use a temporary destination before replacing valuable data.
+There is no automatic retry or replay.
+
+This path creates one ephemeral pull consumer and needs consumer create, info,
+pull, and delete permissions in addition to metadata reads. It attempts consumer
+cleanup for known created consumers; a five-minute inactivity timeout covers
+unconfirmed creation or cleanup that cannot reach the server. The `timeout` keyword covers metadata,
+consumer setup, and each batch; cleanup uses the connection's request timeout.
+It cannot interrupt a blocked destination write. Small objects incur consumer
+setup and cleanup overhead. `get_bytes` and `get_file` keep their existing
+materialization and stream-message-read permissions.
+
 The current object-store surface covers bucket creation/open/delete, put/get
 bytes and strings, multi-chunk objects, digest verification, metadata, metadata
 updates/renames, max-bytes and compression status, links, watchers, binary-safe
