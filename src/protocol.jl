@@ -51,7 +51,12 @@ struct Msg <: ProtocolMessage
     description::String
 end
 
-payload(msg::Msg) = String(msg.data)
+"""
+    payload(msg::Msg) -> String
+
+Return the message payload as text without changing its stored bytes.
+"""
+payload(msg::Msg) = String(copy(msg.data))
 reply_subject(msg::Msg) = msg.reply
 
 function header(msg::Msg, key::AbstractString, default = nothing)
