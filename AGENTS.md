@@ -11,10 +11,12 @@ the `NATS` namespace.
 ```text
 src/NATS.jl                  main module and dependency loading
 src/protocol.jl              NATS wire parser and frame serialization
+src/erased.jl                type-erased transports and callbacks for `juliac --trim`
 src/transport.jl             URL parsing plus Reseau TCP/TLS and HTTP WebSocket setup
 src/connection.jl            connection state, reader loop, reconnect, pub/sub/request
 src/jetstream/JetStream.jl   initial JetStream API helpers
 test/runtests.jl             Harbor-backed integration tests
+test/trim_compile_tests.jl   JuliaC `--trim=safe` build and run of test/nats_trim_safe.jl
 ```
 
 ## Key Types
@@ -34,7 +36,9 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 ```
 
 Tests use Harbor to run `nats:2.10.18` containers on dynamically allocated host
-ports. Docker must be available for the integration suite.
+ports. Docker must be available for the integration suite. On released Julia
+1.13 and later, the suite also compiles `test/nats_trim_safe.jl` with JuliaC
+`--trim=safe` and runs the executable, which takes a few minutes.
 
 ## Development Notes
 

@@ -8,7 +8,6 @@ using Random
 using Reseau
 using Sockets
 using URIs
-using Base64
 
 const DEFAULT_URL = "nats://127.0.0.1:4222"
 const CLIENT_LANG = "julia"
@@ -16,6 +15,7 @@ const CLIENT_VERSION = "0.1.0"
 
 include("errors.jl")
 include("protocol.jl")
+include("erased.jl")
 include("transport.jl")
 include("auth.jl")
 include("connection.jl")

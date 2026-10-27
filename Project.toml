@@ -16,8 +16,8 @@ libsodium_jll = "a9144af2-ca23-56d9-984f-0d03f7b5ccf8"
 
 [compat]
 HTTP = "2"
-JSON = "1"
-Reseau = "1"
+JSON = "1.4"
+Reseau = "1.4.3"
 URIs = "1"
 libsodium_jll = "1"
 julia = "1.10"
