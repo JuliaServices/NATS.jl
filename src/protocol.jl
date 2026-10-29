@@ -126,10 +126,18 @@ function expect_crlf(io)
     return nothing
 end
 
+# Payloads larger than this are read in pieces of this size, so the size a MSG
+# line claims costs only the bytes the server actually sends.
+const PAYLOAD_CHUNK = 1 << 20
+
 function read_payload(io, n::Integer)::Vector{UInt8}
     n < 0 && throw(ProtocolError("negative payload size"))
-    data = read(io, Int(n))
-    length(data) == n || throw(EOFError())
+    data = read(io, min(Int(n), PAYLOAD_CHUNK))
+    while length(data) < n
+        chunk = read(io, min(n - length(data), PAYLOAD_CHUNK))
+        isempty(chunk) && throw(EOFError())
+        append!(data, chunk)
+    end
     expect_crlf(io)
     return data
 end

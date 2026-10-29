@@ -92,6 +92,16 @@ end
     @test reader.io.reads == 2
 end
 
+# The size a MSG line claims is not allocated before its bytes arrive: a corrupt
+# or hostile line can claim up to 2^63 - 1.
+claimed_payload_allocation(size) =
+    @allocated(try NATS.read_protocol_message(protocol_reader("MSG a 1 $size\r\nabc")) catch end)
+
+@testset "a claimed payload size costs only the bytes received" begin
+    @test_throws EOFError NATS.read_protocol_message(protocol_reader("MSG a 1 $(1 << 62)\r\nabc"))
+    @test claimed_payload_allocation(1 << 30) < 16 << 20
+end
+
 # Pauses the reader task after each parsed message, then optionally fails the read.
 struct PausedProtocolReader{T}
     reader::T
