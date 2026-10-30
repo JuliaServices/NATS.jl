@@ -244,6 +244,10 @@ Base.@kwdef struct PubAck
     domain::Union{Nothing, String} = nothing
 end
 
+# The server leaves out `duplicate` (and `domain`) when unset.
+StructUtils.fielddefaults(::StructUtils.StructStyle, ::Type{PubAck}) =
+    (stream = "", seq = UInt64(0), duplicate = false, domain = nothing)
+
 Base.@kwdef struct RawStreamMsg
     stream::String = ""
     subject::String = ""
@@ -399,56 +403,40 @@ Base.@kwdef struct StreamConfig
     allow_batch_publish::Union{Nothing, Bool} = nothing
 end
 
-json_value(value) = value
-json_value(value::Vector) = [json_value(item) for item in value]
-json_value(value::Dict) = Dict(String(k) => json_value(v) for (k, v) in pairs(value))
-json_value(value::SubjectTransformConfig) = Dict{String, Any}(
-    "src" => value.source,
-    "dest" => value.destination,
+# `JSON.json` writes these config types as JetStream API request JSON: field
+# tags give the wire names, and unset (`nothing`) fields are left out.
+
+omit_empty(value) = value === nothing || isempty(value) ? JSON.Omit() : value
+omit_false(value::Bool) = value ? true : JSON.Omit()
+
+StructUtils.fieldtags(::StructUtils.StructStyle, ::Type{SubjectTransformConfig}) = (
+    source = (json = (name = "src",),),
+    destination = (json = (name = "dest",),),
 )
-function json_value(value::RePublish)
-    d = Dict{String, Any}("dest" => value.destination)
-    put_if_present!(d, "src", value.source)
-    value.headers_only && (d["headers_only"] = true)
-    return d
-end
-function json_value(value::Placement)
-    d = Dict{String, Any}()
-    put_if_present!(d, "cluster", value.cluster)
-    isempty(value.tags) || (d["tags"] = copy(value.tags))
-    return d
-end
-json_value(value::ExternalStream) = Dict{String, Any}(
-    "api" => value.api_prefix,
-    "deliver" => value.deliver_prefix,
+StructUtils.fieldtags(::StructUtils.StructStyle, ::Type{RePublish}) = (
+    destination = (json = (name = "dest",),),
+    source = (json = (name = "src",),),
+    headers_only = (json = (lower = omit_false,),),
 )
-function json_value(value::StreamSource)
-    d = Dict{String, Any}("name" => value.name)
-    put_if_present!(d, "opt_start_seq", value.opt_start_seq)
-    put_if_present!(d, "opt_start_time", value.opt_start_time)
-    put_if_present!(d, "filter_subject", value.filter_subject)
-    isempty(value.subject_transforms) || (d["subject_transforms"] = json_value(value.subject_transforms))
-    put_if_present!(d, "external", value.external)
-    return d
-end
-function json_value(value::StreamConsumerLimits)
-    d = Dict{String, Any}()
-    put_if_present!(d, "inactive_threshold", value.inactive_threshold)
-    put_if_present!(d, "max_ack_pending", value.max_ack_pending)
-    return d
+StructUtils.fieldtags(::StructUtils.StructStyle, ::Type{Placement}) = (tags = (json = (lower = omit_empty,),),)
+StructUtils.fieldtags(::StructUtils.StructStyle, ::Type{ExternalStream}) = (
+    api_prefix = (json = (name = "api",),),
+    deliver_prefix = (json = (name = "deliver",),),
+)
+StructUtils.fieldtags(::StructUtils.StructStyle, ::Type{StreamSource}) = (subject_transforms = (json = (lower = omit_empty,),),)
+StructUtils.fieldtags(::StructUtils.StructStyle, ::Type{StreamConfig}) = (
+    replicas = (json = (name = "num_replicas",),),
+    allow_atomic_publish = (json = (name = "allow_atomic",),),
+    allow_batch_publish = (json = (name = "allow_batched",),),
+)
+
+for T in (RePublish, Placement, StreamSource, StreamConsumerLimits, StreamConfig)
+    @eval JSON.omit_null(::Type{$T}) = true
 end
 
-function put_if_present!(d::Dict{String, Any}, key::String, value)
-    value === nothing || (d[key] = json_value(value))
-    return d
-end
-
-function put_if_nonempty!(d::Dict{String, Any}, key::String, value::Union{Nothing, AbstractString})
-    value === nothing && return d
-    value_s = String(value)
-    isempty(value_s) || (d[key] = value_s)
-    return d
-end
+# The request JSON for `value` as a mutable object, for callers that extend or
+# compare request bodies.
+json_object(value) = JSON.parse(JSON.json(value))
 
 function normalize_api_prefix(prefix::AbstractString)
     s = String(prefix)
@@ -504,60 +492,41 @@ function consumer_filter_subjects(config)
     return single, nothing
 end
 
-function config_dict(config::StreamConfig)
-    d = Dict{String, Any}(
-        "name" => config.name,
-        "subjects" => config.subjects,
-        "retention" => config.retention,
-        "storage" => config.storage,
-        "num_replicas" => config.replicas,
-        "allow_direct" => config.allow_direct,
-    )
-    put_if_present!(d, "description", config.description)
-    put_if_present!(d, "max_consumers", config.max_consumers)
-    put_if_present!(d, "max_msgs", config.max_msgs)
-    put_if_present!(d, "max_bytes", config.max_bytes)
-    put_if_present!(d, "discard", config.discard)
-    put_if_present!(d, "discard_new_per_subject", config.discard_new_per_subject)
-    put_if_present!(d, "max_age", config.max_age)
-    put_if_present!(d, "max_msgs_per_subject", config.max_msgs_per_subject)
-    put_if_present!(d, "max_msg_size", config.max_msg_size)
-    put_if_present!(d, "no_ack", config.no_ack)
-    put_if_present!(d, "duplicate_window", config.duplicate_window)
-    put_if_present!(d, "deny_delete", config.deny_delete)
-    put_if_present!(d, "deny_purge", config.deny_purge)
-    put_if_present!(d, "allow_rollup_hdrs", config.allow_rollup_hdrs)
-    put_if_present!(d, "compression", config.compression)
-    put_if_present!(d, "first_seq", config.first_seq)
-    put_if_present!(d, "placement", config.placement)
-    put_if_present!(d, "mirror", config.mirror)
-    put_if_present!(d, "sources", config.sources)
-    put_if_present!(d, "sealed", config.sealed)
-    put_if_present!(d, "subject_transform", config.subject_transform)
-    put_if_present!(d, "republish", config.republish)
-    put_if_present!(d, "mirror_direct", config.mirror_direct)
-    put_if_present!(d, "consumer_limits", config.consumer_limits)
-    put_if_present!(d, "metadata", config.metadata)
-    put_if_present!(d, "allow_msg_ttl", config.allow_msg_ttl)
-    put_if_present!(d, "subject_delete_marker_ttl", config.subject_delete_marker_ttl)
-    put_if_present!(d, "allow_msg_counter", config.allow_msg_counter)
-    put_if_present!(d, "allow_atomic", config.allow_atomic_publish)
-    put_if_present!(d, "allow_msg_schedules", config.allow_msg_schedules)
-    put_if_present!(d, "persist_mode", config.persist_mode)
-    put_if_present!(d, "allow_batched", config.allow_batch_publish)
-    return d
+config_dict(config::StreamConfig) = json_object(config)
+
+# Typed views of JetStream API replies, holding the fields NATS.jl itself
+# reads. Every field is optional because the server leaves out unset ones.
+# Each view nests at most one struct: Julia 1.13 and earlier cannot compile a
+# deeper typed parse under `juliac --trim`.
+
+struct APIErrorBody
+    code::Union{Nothing, Int}
+    err_code::Union{Nothing, Int}
+    description::Union{Nothing, String}
 end
 
-function throw_if_api_error(obj)
-    if haskey(obj, :error)
-        err = obj.error
-        throw(JetStreamError(
-            Base.get(err, :code, 0),
-            Base.get(err, :err_code, 0),
-            String(Base.get(err, :description, "")),
-        ))
-    end
-    return obj
+struct APIReply
+    error::Union{Nothing, APIErrorBody}
+end
+
+struct ConsumerInfoConfig
+    deliver_subject::Union{Nothing, String}
+    deliver_group::Union{Nothing, String}
+    ack_policy::Union{Nothing, String}
+    max_batch::Union{Nothing, Int}
+    max_expires::Union{Nothing, Int64}
+    max_bytes::Union{Nothing, Int}
+end
+
+struct ConsumerInfoFields
+    name::Union{Nothing, String}
+    config::Union{Nothing, ConsumerInfoConfig}
+end
+
+function throw_if_api_error(data::AbstractVector{UInt8})
+    err = JSON.parse(data, APIReply).error
+    err === nothing && return nothing
+    throw(JetStreamError(something(err.code, 0), something(err.err_code, 0), something(err.description, "")))
 end
 
 function string_vector_field(obj, field::Symbol)
@@ -570,22 +539,20 @@ function object_vector_field(obj, field::Symbol)
     return collect(obj[field])
 end
 
-function pub_ack(obj)
-    throw_if_api_error(obj)
-    domain = haskey(obj, :domain) ? String(obj.domain) : nothing
-    return PubAck(
-        stream = String(Base.get(obj, :stream, "")),
-        seq = UInt64(Base.get(obj, :seq, 0)),
-        duplicate = Bool(Base.get(obj, :duplicate, false)),
-        domain = domain,
-    )
+function pub_ack(data::AbstractVector{UInt8})
+    throw_if_api_error(data)
+    return JSON.parse(data, PubAck)
 end
 
-function api_request(conn::NATS.Connection, subject::AbstractString, body = UInt8[]; timeout::Real = conn.options.request_timeout)
-    msg = NATS.request(conn, subject, body; timeout)
-    obj = JSON.parse(NATS.payload(msg))
-    return throw_if_api_error(obj)
+# The reply payload of a JetStream API request, after checking it for an API error.
+function api_request_data(conn::NATS.Connection, subject::AbstractString, body = UInt8[]; timeout::Real = conn.options.request_timeout)
+    data = NATS.request(conn, subject, body; timeout).data
+    throw_if_api_error(data)
+    return data
 end
+
+api_request(conn::NATS.Connection, subject::AbstractString, body = UInt8[]; timeout::Real = conn.options.request_timeout) =
+    JSON.parse(api_request_data(conn, subject, body; timeout))::JSON.Object{String, Any}
 
 function api_request_msg(conn::NATS.Connection, subject::AbstractString, body = UInt8[]; timeout::Real = conn.options.request_timeout)
     subject_s = NATS.validate_publish_subject(subject; skip = conn.options.skip_subject_validation)
@@ -620,7 +587,7 @@ function create_stream(
     domain::Union{Nothing, AbstractString} = nothing,
 )
     stream = validate_stream_name(config.name)
-    body = JSON.json(config_dict(config))
+    body = JSON.json(config)
     try
         return api_request(conn, api_subject("STREAM.CREATE.$stream"; api_prefix, domain), body; timeout)
     catch err
@@ -637,7 +604,7 @@ function update_stream(
     domain::Union{Nothing, AbstractString} = nothing,
 )
     stream = validate_stream_name(config.name)
-    body = JSON.json(config_dict(config))
+    body = JSON.json(config)
     try
         return api_request(conn, api_subject("STREAM.UPDATE.$stream"; api_prefix, domain), body; timeout)
     catch err
@@ -747,11 +714,13 @@ function overlapping_filter_subjects(err)
     return err.code == 500 && occursin("filter", lowercase(err.description)) && occursin("overlap", lowercase(err.description))
 end
 
-function ensure_multiple_filter_subjects_supported(info, filter_subjects)
+# Servers without multiple filter subject support drop them from the reply.
+function ensure_multiple_filter_subjects_supported(info::JSON.Object{String, Any}, filter_subjects)
     filter_subjects === nothing && return info
     isempty(filter_subjects) && return info
-    haskey(info, :config) || throw(MultipleFilterSubjectsNotSupportedError())
-    isempty(string_vector_field(info.config, :filter_subjects)) && throw(MultipleFilterSubjectsNotSupportedError())
+    cfg = Base.get(info, "config", nothing)
+    echoed = cfg isa JSON.Object{String, Any} ? Base.get(cfg, "filter_subjects", nothing) : nothing
+    (echoed isa Vector{Any} && !isempty(echoed)) || throw(MultipleFilterSubjectsNotSupportedError())
     return info
 end
 
@@ -1117,7 +1086,7 @@ function publish(
         schedule_timezone,
     )
     msg = request_publish_ack(conn, subject, data, hdr, timeout, retry_attempts, retry_wait)
-    return pub_ack(JSON.parse(NATS.payload(msg)))
+    return pub_ack(msg.data)
 end
 
 function publish_async_pending(conn::NATS.Connection)
@@ -1220,7 +1189,7 @@ function async_ack_result(msg::NATS.Msg)
     if msg.status >= 400
         throw(JetStreamError(msg.status, 0, msg.description))
     end
-    return pub_ack(JSON.parse(NATS.payload(msg)))
+    return pub_ack(msg.data)
 end
 
 function pub_ack_task(
@@ -1258,9 +1227,9 @@ function pub_ack_task(
                     throw(err)
                 end
                 ack_or_err = take!(ch)
-                if ack_or_err isa Exception
-                    publish_async_error!(conn, error_cb, msg, ack_or_err)
-                    throw(ack_or_err)
+                if ack_or_err isa NATS.PubAckAbort
+                    publish_async_error!(conn, error_cb, msg, ack_or_err.error)
+                    throw(ack_or_err.error)
                 elseif !(ack_or_err isa NATS.Msg)
                     err = NATS.ProtocolError("unexpected async publish acknowledgement: $(typeof(ack_or_err))")
                     publish_async_error!(conn, error_cb, msg, err)
@@ -1444,45 +1413,27 @@ mutable struct OrderedConsumer
     closed::Bool
 end
 
-function config_dict(config::ConsumerConfig)
-    filter_subject, filter_subjects = consumer_filter_subjects(config)
-    d = Dict{String, Any}(
-        "ack_policy" => config.ack_policy,
-        "ack_wait" => config.ack_wait,
-    )
-    put_if_nonempty!(d, "durable_name", config.durable_name)
-    put_if_nonempty!(d, "name", config.name)
-    put_if_present!(d, "description", config.description)
-    put_if_present!(d, "deliver_policy", config.deliver_policy)
-    put_if_present!(d, "opt_start_seq", config.opt_start_seq)
-    put_if_present!(d, "opt_start_time", config.opt_start_time)
-    put_if_present!(d, "filter_subject", filter_subject)
-    put_if_present!(d, "filter_subjects", filter_subjects)
-    put_if_present!(d, "max_deliver", config.max_deliver)
-    put_if_present!(d, "backoff", config.backoff)
-    put_if_present!(d, "replay_policy", config.replay_policy)
-    put_if_present!(d, "rate_limit_bps", config.rate_limit_bps)
-    put_if_present!(d, "sample_freq", config.sample_freq)
-    put_if_present!(d, "max_waiting", config.max_waiting)
-    put_if_present!(d, "max_ack_pending", config.max_ack_pending)
-    put_if_present!(d, "flow_control", config.flow_control)
-    put_if_present!(d, "idle_heartbeat", config.idle_heartbeat)
-    put_if_present!(d, "headers_only", config.headers_only)
-    put_if_present!(d, "max_batch", config.max_batch)
-    put_if_present!(d, "max_expires", config.max_expires)
-    put_if_present!(d, "max_bytes", config.max_bytes)
-    put_if_present!(d, "deliver_subject", config.deliver_subject)
-    put_if_present!(d, "deliver_group", config.deliver_group)
-    put_if_present!(d, "inactive_threshold", config.inactive_threshold)
-    put_if_present!(d, "num_replicas", config.replicas)
-    put_if_present!(d, "mem_storage", config.memory_storage)
-    put_if_present!(d, "metadata", config.metadata)
-    put_if_present!(d, "pause_until", config.pause_until)
-    put_if_present!(d, "priority_policy", config.priority_policy)
-    put_if_present!(d, "priority_timeout", config.priority_timeout)
-    put_if_present!(d, "priority_groups", config.priority_groups)
-    return d
+# Empty names and filters are unset; `consumer_filter_subjects` validates the
+# filters before a config is sent.
+StructUtils.fieldtags(::StructUtils.StructStyle, ::Type{ConsumerConfig}) = (
+    durable_name = (json = (lower = omit_empty,),),
+    name = (json = (lower = omit_empty,),),
+    filter_subject = (json = (lower = omit_empty,),),
+    filter_subjects = (json = (lower = omit_empty,),),
+    replicas = (json = (name = "num_replicas",),),
+    memory_storage = (json = (name = "mem_storage",),),
+)
+JSON.omit_null(::Type{ConsumerConfig}) = true
+
+config_dict(config::ConsumerConfig) = json_object(config)
+
+# The body of a consumer create or update request.
+struct ConsumerRequest{C}
+    stream_name::String
+    config::C
+    action::Union{Nothing, String}
 end
+JSON.omit_null(::Type{<:ConsumerRequest}) = true
 
 function consumer_name(config::ConsumerConfig)
     consumer = config.name
@@ -1509,14 +1460,8 @@ function consumer_create_subject(
     return api_subject("CONSUMER.CREATE.$stream.$consumer"; api_prefix, domain)
 end
 
-function consumer_config_body(stream::AbstractString, config, action::Union{Nothing, AbstractString})
-    body = Dict{String, Any}("stream_name" => String(stream), "config" => config)
-    action === nothing || (body["action"] = String(action))
-    return JSON.json(body)
-end
-
-consumer_config_body(stream::AbstractString, config::ConsumerConfig, action::Union{Nothing, AbstractString}) =
-    consumer_config_body(stream, config_dict(config), action)
+consumer_config_body(stream::AbstractString, config, action::Union{Nothing, AbstractString}) =
+    JSON.json(ConsumerRequest(String(stream), config, action === nothing ? nothing : String(action)))
 
 function upsert_consumer(
     conn::NATS.Connection,
@@ -1568,7 +1513,10 @@ end
 create_or_update_consumer(conn::NATS.Connection, stream::AbstractString, config::ConsumerConfig; kwargs...) =
     upsert_consumer(conn, stream, config, ""; kwargs...)
 
-function consumer_info(
+consumer_info(conn::NATS.Connection, stream::AbstractString, consumer::AbstractString; kwargs...) =
+    JSON.parse(consumer_info_data(conn, stream, consumer; kwargs...))
+
+function consumer_info_data(
     conn::NATS.Connection,
     stream::AbstractString,
     consumer::AbstractString;
@@ -1579,7 +1527,7 @@ function consumer_info(
     stream_s = validate_stream_name(stream)
     consumer_s = validate_consumer_name(consumer)
     try
-        return api_request(conn, api_subject("CONSUMER.INFO.$stream_s.$consumer_s"; api_prefix, domain), UInt8[]; timeout)
+        return api_request_data(conn, api_subject("CONSUMER.INFO.$stream_s.$consumer_s"; api_prefix, domain), UInt8[]; timeout)
     catch err
         consumer_not_found(err) && throw(ConsumerNotFoundError(stream_s, consumer_s))
         stream_not_found(err) && throw(StreamNotFoundError(stream_s))
@@ -1924,16 +1872,12 @@ function unregister_ack_none_consumer!(
     return nothing
 end
 
-function consumer_ack_policy(info)
-    haskey(info, :config) || return ""
-    cfg = info.config
-    haskey(cfg, :ack_policy) || return ""
-    raw = cfg.ack_policy
-    raw === nothing && return ""
-    return lowercase(String(raw))
+function consumer_ack_policy(info::ConsumerInfoFields)
+    policy = info.config === nothing ? nothing : info.config.ack_policy
+    return policy === nothing ? "" : lowercase(policy)
 end
 
-is_ack_none_consumer_info(info) = consumer_ack_policy(info) == "none"
+is_ack_none_consumer_info(info::ConsumerInfoFields) = consumer_ack_policy(info) == "none"
 
 function reset_ordered_consumer!(
     oc::OrderedConsumer;
@@ -2133,6 +2077,20 @@ function check_pull_no_wait_heartbeat(no_wait::Bool, heartbeat_ns::Union{Nothing
     return nothing
 end
 
+# The body of a pull consumer's next-messages request.
+struct PullRequest
+    batch::Int
+    expires::Union{Nothing, Int64}
+    no_wait::Union{Nothing, Bool}
+    max_bytes::Union{Nothing, Int}
+    min_pending::Union{Nothing, Int64}
+    min_ack_pending::Union{Nothing, Int64}
+    group::Union{Nothing, String}
+    priority::Union{Nothing, Int}
+    idle_heartbeat::Union{Nothing, Int64}
+end
+JSON.omit_null(::Type{PullRequest}) = true
+
 function next_request_body(;
     batch::Integer = 1,
     expires_ns::Integer = 5_000_000_000,
@@ -2146,19 +2104,17 @@ function next_request_body(;
 )
     check_pull_request_options(batch, expires_ns, max_bytes, min_pending, min_ack_pending, priority, heartbeat_ns)
     check_pull_no_wait_heartbeat(no_wait, heartbeat_ns)
-    body = Dict{String, Any}("batch" => batch)
-    max_bytes === nothing || (body["max_bytes"] = Int(max_bytes))
-    min_pending === nothing || (body["min_pending"] = Int64(min_pending))
-    min_ack_pending === nothing || (body["min_ack_pending"] = Int64(min_ack_pending))
-    priority_group === nothing || (body["group"] = String(priority_group))
-    priority === nothing || (body["priority"] = Int(priority))
-    heartbeat_ns === nothing || heartbeat_ns == 0 || (body["idle_heartbeat"] = Int64(heartbeat_ns))
-    if no_wait
-        body["no_wait"] = true
-    else
-        body["expires"] = expires_ns
-    end
-    return JSON.json(body)
+    return JSON.json(PullRequest(
+        Int(batch),
+        no_wait ? nothing : Int64(expires_ns),
+        no_wait ? true : nothing,
+        max_bytes === nothing ? nothing : Int(max_bytes),
+        min_pending === nothing ? nothing : Int64(min_pending),
+        min_ack_pending === nothing ? nothing : Int64(min_ack_pending),
+        priority_group === nothing ? nothing : String(priority_group),
+        priority === nothing ? nothing : Int(priority),
+        heartbeat_ns === nothing || heartbeat_ns == 0 ? nothing : Int64(heartbeat_ns),
+    ))
 end
 
 function normalized_status_description(msg::NATS.Msg)
@@ -2356,39 +2312,20 @@ function fetch_bytes(
     )
 end
 
-function optional_positive_int_field(obj, field::Symbol, ::Type{T} = Int) where {T <: Integer}
-    haskey(obj, field) || return nothing
-    raw = getproperty(obj, field)
-    raw === nothing && return nothing
-    value = try
-        T(raw)
-    catch
-        return nothing
-    end
-    return value > 0 ? value : nothing
-end
+positive_or_nothing(value) = value === nothing || value <= 0 ? nothing : value
 
-function pull_request_limits(info)
-    haskey(info, :config) || return nothing, nothing, nothing
+function pull_request_limits(info::ConsumerInfoFields)
     cfg = info.config
-    return (
-        optional_positive_int_field(cfg, :max_batch, Int),
-        optional_positive_int_field(cfg, :max_expires, Int64),
-        optional_positive_int_field(cfg, :max_bytes, Int),
-    )
+    cfg === nothing && return nothing, nothing, nothing
+    return positive_or_nothing(cfg.max_batch), positive_or_nothing(cfg.max_expires), positive_or_nothing(cfg.max_bytes)
 end
 
-function consumer_deliver_subject(info)
-    haskey(info, :config) || return nothing
-    cfg = info.config
-    haskey(cfg, :deliver_subject) || return nothing
-    raw = cfg.deliver_subject
-    raw === nothing && return nothing
-    deliver_subject = String(raw)
-    return isempty(deliver_subject) ? nothing : deliver_subject
+function consumer_deliver_subject(info::ConsumerInfoFields)
+    deliver_subject = info.config === nothing ? nothing : info.config.deliver_subject
+    return deliver_subject === nothing || isempty(deliver_subject) ? nothing : deliver_subject
 end
 
-function ensure_pull_consumer(info)
+function ensure_pull_consumer(info::ConsumerInfoFields)
     consumer_deliver_subject(info) === nothing || throw(ArgumentError("consumer is not a pull consumer"))
     return nothing
 end
@@ -2444,12 +2381,13 @@ function pull_subscribe(
     stream_s = validate_stream_name(stream)
     consumer_s = validate_consumer_name(consumer)
     prefix = api_prefix_value(; api_prefix, domain)
-    info = consumer_info(conn, stream_s, consumer_s; timeout, api_prefix = prefix)
-    ensure_pull_consumer(info)
-    max_request_batch, max_request_expires, max_request_max_bytes = pull_request_limits(info)
+    data = consumer_info_data(conn, stream_s, consumer_s; timeout, api_prefix = prefix)
+    fields = JSON.parse(data, ConsumerInfoFields)
+    ensure_pull_consumer(fields)
+    max_request_batch, max_request_expires, max_request_max_bytes = pull_request_limits(fields)
     inbox = NATS.new_inbox(conn)
     sub = NATS.subscribe(conn, inbox; channel_size)
-    ack_none = is_ack_none_consumer_info(info)
+    ack_none = is_ack_none_consumer_info(fields)
     ack_none && register_ack_none_consumer!(conn, ack_domain_from_api_prefix(prefix), stream_s, consumer_s)
     register_subscription_consumer_cleanup!(conn, sub, stream_s, consumer_s, prefix, false, ack_none)
     return PullSubscription(
@@ -2459,7 +2397,7 @@ function pull_subscribe(
         prefix,
         inbox,
         sub,
-        info,
+        JSON.parse(data),
         max_request_batch,
         max_request_expires,
         max_request_max_bytes,
@@ -2512,8 +2450,9 @@ function create_push_consumer(
     consumer = consumer_name(config)
     body = consumer_config_body(stream_s, d, "create")
     try
-        info = api_request(conn, consumer_create_subject(stream_s, consumer, config; api_prefix, domain), body; timeout)
-        return ensure_multiple_filter_subjects_supported(info, filter_subjects)
+        data = api_request_data(conn, consumer_create_subject(stream_s, consumer, config; api_prefix, domain), body; timeout)
+        ensure_multiple_filter_subjects_supported(JSON.parse(data)::JSON.Object{String, Any}, filter_subjects)
+        return data
     catch err
         stream_not_found(err) && throw(StreamNotFoundError(stream_s))
         overlapping_filter_subjects(err) && throw(OverlappingFilterSubjectsError())
@@ -2535,31 +2474,31 @@ function validate_push_queue_controls(config::ConsumerConfig)
     return nothing
 end
 
-function push_consumer_delivery(info)
+function push_consumer_delivery(info::ConsumerInfoFields)
     deliver_subject = consumer_deliver_subject(info)
     deliver_subject === nothing && throw(ArgumentError("consumer is not a push consumer"))
-    cfg = info.config
-    deliver_group = haskey(cfg, :deliver_group) ? String(cfg.deliver_group) : nothing
-    return deliver_subject, deliver_group
+    return deliver_subject, (info.config::ConsumerInfoConfig).deliver_group
 end
 
+# `data` is the consumer info reply the subscription was created from.
 function push_subscription(
     conn::NATS.Connection,
     stream::AbstractString,
-    info,
+    data::Vector{UInt8},
     deliver_subject::AbstractString,
     deliver_group::Union{Nothing, AbstractString},
     sub::NATS.Subscription,
     api_prefix::AbstractString,
     delete_on_close::Bool,
 )
-    consumer = haskey(info, :name) ? String(info.name) : ""
+    fields = JSON.parse(data, ConsumerInfoFields)
+    consumer = something(fields.name, "")
     isempty(consumer) && throw(JetStreamError(500, 0, "push consumer info missing name"))
     stream_s = String(stream)
     prefix = String(api_prefix)
-    ack_none = is_ack_none_consumer_info(info)
+    ack_none = is_ack_none_consumer_info(fields)
     ack_none && register_ack_none_consumer!(conn, ack_domain_from_api_prefix(prefix), stream_s, consumer)
-    psub = PushSubscription(conn, stream_s, consumer, prefix, String(deliver_subject), deliver_group === nothing ? nothing : String(deliver_group), sub, info, delete_on_close, ack_none, ReentrantLock(), false)
+    psub = PushSubscription(conn, stream_s, consumer, prefix, String(deliver_subject), deliver_group === nothing ? nothing : String(deliver_group), sub, JSON.parse(data), delete_on_close, ack_none, ReentrantLock(), false)
     register_subscription_consumer_cleanup!(conn, sub, psub.stream, psub.consumer, psub.api_prefix, delete_on_close, ack_none)
     return psub
 end
@@ -2580,8 +2519,8 @@ function push_subscribe(
     validate_push_queue_controls(config)
     sub = NATS.subscribe(conn, deliver_subject; queue = deliver_group, channel_size)
     try
-        info = create_push_consumer(conn, stream, config, deliver_subject, deliver_group; timeout, api_prefix = prefix)
-        return push_subscription(conn, stream, info, deliver_subject, deliver_group, sub, prefix, true)
+        data = create_push_consumer(conn, stream, config, deliver_subject, deliver_group; timeout, api_prefix = prefix)
+        return push_subscription(conn, stream, data, deliver_subject, deliver_group, sub, prefix, true)
     catch
         try NATS.unsubscribe(conn, sub) catch end
         rethrow()
@@ -2599,10 +2538,10 @@ function push_subscribe(
 )
     channel_size >= 1 || throw(ArgumentError("channel_size must be positive"))
     prefix = api_prefix_value(; api_prefix, domain)
-    info = consumer_info(conn, stream, consumer; timeout, api_prefix = prefix)
-    deliver_subject, deliver_group = push_consumer_delivery(info)
+    data = consumer_info_data(conn, stream, consumer; timeout, api_prefix = prefix)
+    deliver_subject, deliver_group = push_consumer_delivery(JSON.parse(data, ConsumerInfoFields))
     sub = NATS.subscribe(conn, deliver_subject; queue = deliver_group, channel_size)
-    return push_subscription(conn, stream, info, deliver_subject, deliver_group, sub, prefix, false)
+    return push_subscription(conn, stream, data, deliver_subject, deliver_group, sub, prefix, false)
 end
 
 function Base.close(psub::PushSubscription)
@@ -2651,8 +2590,9 @@ function consumer_info(psub::PushSubscription; timeout::Real = psub.connection.o
     finally
         unlock(psub.lock)
     end
-    info = consumer_info(conn, stream, consumer; timeout, api_prefix)
-    push_consumer_delivery(info)
+    data = consumer_info_data(conn, stream, consumer; timeout, api_prefix)
+    push_consumer_delivery(JSON.parse(data, ConsumerInfoFields))
+    info = JSON.parse(data)
     lock(psub.lock)
     try
         ensure_push_subscription_open_locked(psub)
@@ -2786,9 +2726,11 @@ function consumer_info(psub::PullSubscription; timeout::Real = psub.connection.o
     finally
         unlock(psub.lock)
     end
-    info = consumer_info(conn, stream, consumer; timeout, api_prefix)
-    ensure_pull_consumer(info)
-    max_request_batch, max_request_expires, max_request_max_bytes = pull_request_limits(info)
+    data = consumer_info_data(conn, stream, consumer; timeout, api_prefix)
+    fields = JSON.parse(data, ConsumerInfoFields)
+    ensure_pull_consumer(fields)
+    max_request_batch, max_request_expires, max_request_max_bytes = pull_request_limits(fields)
+    info = JSON.parse(data)
     lock(psub.lock)
     try
         ensure_pull_subscription_open_locked(psub)
@@ -3239,7 +3181,7 @@ function consume(
         false,
         close_pull,
     )
-    ctx.task = errormonitor(@async consume_loop(ctx, batch, expires_ns, no_wait, timeout, max_bytes, min_pending, min_ack_pending, priority_group, priority, heartbeat_ns))
+    ctx.task = NATS.monitored_task(() -> consume_loop(ctx, batch, expires_ns, no_wait, timeout, max_bytes, min_pending, min_ack_pending, priority_group, priority, heartbeat_ns))
     return ctx
 end
 
@@ -3265,7 +3207,7 @@ function consume(
             false,
             close_ordered,
         )
-        ctx.task = errormonitor(@async ordered_consume_loop(ctx, oc, batch, expires_ns, no_wait, timeout, channel_size))
+        ctx.task = NATS.monitored_task(() -> ordered_consume_loop(ctx, oc, batch, expires_ns, no_wait, timeout, channel_size))
         return ctx
     catch
         ordered_end_operation!(oc)
@@ -3290,7 +3232,7 @@ function consume(
         false,
         close_push,
     )
-    ctx.task = errormonitor(@async push_consume_loop(ctx, poll_interval))
+    ctx.task = NATS.monitored_task(() -> push_consume_loop(ctx, poll_interval))
     return ctx
 end
 
@@ -3672,13 +3614,13 @@ function kv_config_dict(config::KeyValueConfig)
         d["subject_delete_marker_ttl"] = config.limit_marker_ttl_ns
     end
     config.metadata === nothing || (d["metadata"] = config.metadata)
-    put_if_present!(d, "republish", config.republish)
+    config.republish === nothing || (d["republish"] = json_object(config.republish))
     if config.mirror !== nothing
-        d["mirror"] = json_value(kv_mirror_source(config.mirror))
+        d["mirror"] = json_object(kv_mirror_source(config.mirror))
         d["mirror_direct"] = true
     elseif config.sources !== nothing && !isempty(config.sources)
         d["subjects"] = [kv_subject(bucket, ">")]
-        d["sources"] = json_value([kv_source_config(source, bucket) for source in config.sources])
+        d["sources"] = json_object([kv_source_config(source, bucket) for source in config.sources])
     else
         d["subjects"] = [kv_subject(bucket, ">")]
     end
@@ -4460,7 +4402,7 @@ function watch_filtered(
     if !updates_only && initial_pending == 0
         put!(watcher.updates, nothing)
     end
-    watcher.task = errormonitor(@async watcher_loop(watcher, initial_pending, updates_only, ignore_deletes))
+    watcher.task = NATS.monitored_task(() -> watcher_loop(watcher, initial_pending, updates_only, ignore_deletes))
     return watcher
 end
 
@@ -4599,11 +4541,11 @@ function object_not_found(err)
     return err isa JetStreamError && (err.code == 404 || occursin("not found", lowercase(err.description)))
 end
 
-function object_store_config_dict(config::ObjectStoreConfig)
+function object_store_stream_config(config::ObjectStoreConfig)
     bucket = check_bucket(config.bucket)
     replicas = config.replicas == 0 ? 1 : config.replicas
     max_bytes = config.max_bytes == 0 ? -1 : config.max_bytes
-    return config_dict(StreamConfig(
+    return StreamConfig(
         name = object_stream(bucket),
         subjects = ["$(object_chunk_prefix(bucket))>", "$(object_meta_prefix(bucket))>"],
         description = config.description,
@@ -4617,7 +4559,7 @@ function object_store_config_dict(config::ObjectStoreConfig)
         allow_direct = true,
         compression = config.compression ? "s2" : nothing,
         metadata = config.metadata,
-    ))
+    )
 end
 
 function object_store_from_bucket(conn::NATS.Connection, bucket::AbstractString; api_prefix::AbstractString = DEFAULT_API_PREFIX)
@@ -4633,7 +4575,7 @@ function create_object_store(
     domain::Union{Nothing, AbstractString} = nothing,
 )
     prefix = api_prefix_value(; api_prefix, domain)
-    api_request(conn, api_subject_from_prefix(prefix, "STREAM.CREATE.$(object_stream(check_bucket(config.bucket)))"), JSON.json(object_store_config_dict(config)); timeout)
+    api_request(conn, api_subject_from_prefix(prefix, "STREAM.CREATE.$(object_stream(check_bucket(config.bucket)))"), JSON.json(object_store_stream_config(config)); timeout)
     return object_store_from_bucket(conn, config.bucket; api_prefix = prefix)
 end
 
@@ -4647,7 +4589,7 @@ function update_object_store(
     prefix = api_prefix_value(; api_prefix, domain)
     bucket = check_bucket(config.bucket)
     try
-        api_request(conn, api_subject_from_prefix(prefix, "STREAM.UPDATE.$(object_stream(bucket))"), JSON.json(object_store_config_dict(config)); timeout)
+        api_request(conn, api_subject_from_prefix(prefix, "STREAM.UPDATE.$(object_stream(bucket))"), JSON.json(object_store_stream_config(config)); timeout)
     catch err
         stream_not_found(err) && throw(BucketNotFoundError(bucket))
         rethrow()
@@ -5339,7 +5281,7 @@ function watch(
     if !updates_only && initial_pending == 0
         put!(watcher.updates, nothing)
     end
-    watcher.task = errormonitor(@async object_watcher_loop(watcher, initial_pending, updates_only, ignore_deletes))
+    watcher.task = NATS.monitored_task(() -> object_watcher_loop(watcher, initial_pending, updates_only, ignore_deletes))
     return watcher
 end
 

@@ -357,7 +357,15 @@ NATS.set_closed_handler!(conn, conn -> @info "NATS closed")
 
 `error_cb` can use either the older `(conn, err)` form or the `nats.go`-style
 `(conn, sub, err)` form. `sub` is the affected subscription when the client can
-identify one, such as slow-consumer errors, and `nothing` otherwise.
+identify one, such as slow-consumer errors, and `nothing` otherwise. Each error
+passed to `error_cb` is also queued on `conn.async_errors` as a `NATS.AsyncError`,
+whose `error` field holds the exception and `subscription` field the affected
+subscription or `nothing`; errors thrown by event callbacks are queued there too.
+
+When a program is compiled with `juliac --trim`, callbacks are called with the
+runtime types of their arguments, so a callback that takes an error should
+annotate it with `@nospecialize`, as in `error_cb = (conn, sub, @nospecialize(err)) -> ...`,
+unless it is small enough to inline.
 
 You can force a reconnect without enabling automatic reconnect, and both
 connections and individual subscriptions can be drained. Subscriptions can also

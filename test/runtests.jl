@@ -1512,6 +1512,10 @@ end
 end
 
 @testset "nkey helpers and connect payload" begin
+    for n in 0:70
+        bytes = UInt8[mod(7i + 3, 256) for i in 1:n]
+        @test NATS.base64url_no_padding(bytes) == replace(base64encode(bytes), '+' => '-', '/' => '_', '=' => "")
+    end
     public = NATS.nkey_public_from_seed(NKEY_TEST_SEED)
     @test startswith(public, "U")
     @test length(NATS.nkey_sign(NKEY_TEST_SEED, "anonce")) == 64
@@ -2548,7 +2552,7 @@ with_nats() do url
                 callback_events = Channel{Any}(1)
                 NATS.set_error_handler!(conn, (_conn, sub, err) -> put!(callback_events, (sub, err)))
                 @test wait_ready(ready) === true
-                err = wait_ready(conn.async_errors)
+                err = wait_ready(conn.async_errors).error
                 @test err isa NATS.PermissionViolationError
                 @test occursin("Foo", err.message)
                 callback_sub, callback_err = wait_ready(callback_events)
@@ -2582,7 +2586,7 @@ with_nats() do url
                 @test wait_ready(sub_status) == NATS.SUBSCRIPTION_CLOSED
                 @test !NATS.is_valid(sub)
                 @test_throws NATS.PermissionViolationError NATS.next_msg(sub; timeout = 0.01)
-                async_err = wait_ready(conn.async_errors)
+                async_err = wait_ready(conn.async_errors).error
                 @test async_err isa NATS.PermissionViolationError
                 @test NATS.last_error(conn) isa NATS.PermissionViolationError
                 @test NATS.connection_status(conn) == NATS.CONNECTED
@@ -2597,7 +2601,7 @@ with_nats() do url
                 @test wait_ready(events)[2] == "PING"
                 sub = NATS.subscribe(conn, "natsjl.denied")
                 @test startswith(wait_ready(events), "SUB natsjl.denied ")
-                async_err = wait_ready(conn.async_errors)
+                async_err = wait_ready(conn.async_errors).error
                 @test async_err isa NATS.PermissionViolationError
                 @test NATS.last_error(conn) isa NATS.PermissionViolationError
                 @test NATS.connection_status(conn) == NATS.CONNECTED
@@ -2614,7 +2618,7 @@ with_nats() do url
             conn = NATS.connect(url; allow_reconnect = false, closed_cb = conn -> put!(closed, NATS.connection_status(conn)))
             try
                 @test wait_ready(ready) === true
-                err = wait_ready(conn.async_errors)
+                err = wait_ready(conn.async_errors).error
                 @test err isa NATS.ServerError
                 @test err.message == "Mystery Server Error"
                 @test wait_ready(closed) == NATS.CLOSED
@@ -2634,7 +2638,7 @@ with_nats() do url
             )
             try
                 @test wait_ready(ready) === true
-                err = wait_ready(conn.async_errors)
+                err = wait_ready(conn.async_errors).error
                 @test err isa NATS.ServerError
                 @test err.message == "Terminal Server Error"
                 @test wait_ready(closed) == NATS.CLOSED
@@ -2807,7 +2811,7 @@ with_nats() do url
             NATS.publish(conn, "natsjl.fast", "reader-still-moving")
             NATS.flush(conn; timeout = 2)
 
-            err = wait_ready(conn.async_errors)
+            err = wait_ready(conn.async_errors).error
             cb_sub, cb_err = wait_ready(error_events)
             @test err isa NATS.SlowConsumerError
             @test cb_sub === slow
@@ -2847,7 +2851,7 @@ with_nats() do url
             NATS.publish(conn, "natsjl.slow", "slow-again-1")
             NATS.publish(conn, "natsjl.slow", "slow-again-2")
             NATS.flush(conn; timeout = 2)
-            again_err = wait_ready(conn.async_errors)
+            again_err = wait_ready(conn.async_errors).error
             again_cb_sub, again_cb_err = wait_ready(error_events)
             @test again_err isa NATS.SlowConsumerError
             @test again_cb_sub === slow
@@ -2896,7 +2900,7 @@ with_nats() do url
             end
             NATS.flush(byte_conn; timeout = 2)
 
-            byte_err = wait_ready(byte_conn.async_errors)
+            byte_err = wait_ready(byte_conn.async_errors).error
             @test byte_err isa NATS.SlowConsumerError
             @test byte_err.subject == "natsjl.slow-bytes"
             @test byte_err.pending_bytes > byte_err.bytes_limit
@@ -2955,7 +2959,7 @@ with_nats() do url
             NATS.flush(callback_slow_conn; timeout = 2)
 
             @test wait_ready(callback_seen) == "callback-1"
-            callback_err = wait_ready(callback_slow_conn.async_errors)
+            callback_err = wait_ready(callback_slow_conn.async_errors).error
             callback_cb_err = wait_ready(callback_errors)
             @test callback_err isa NATS.SlowConsumerError
             @test callback_cb_err isa NATS.SlowConsumerError
@@ -3191,7 +3195,7 @@ with_nats() do url
                 NATS.publish(callback_conn, "natsjl.callback-errors", "bad")
                 NATS.publish(callback_conn, "natsjl.callback-errors", "good")
                 NATS.flush(callback_conn; timeout = 2)
-                @test wait_ready(callback_conn.async_errors) isa ErrorException
+                @test wait_ready(callback_conn.async_errors).error isa ErrorException
                 @test wait_ready(callback_seen) == "good"
                 NATS.unsubscribe(callback_sub)
 
@@ -6251,7 +6255,7 @@ with_nats_container() do _container, url, port
             wait(reconnect_task)
             @test NATS.is_closed(conn)
             @test conn.io === old_io
-            @test !isopen(conn.io)
+            @test !isopen(conn.io.io)
             @test NATS.stats(conn).reconnects == 0
             @test timedwait(() -> istaskdone(attempt), 5) == :ok
             @test fetch(attempt) isa NATS.ConnectionClosedError
@@ -6309,7 +6313,7 @@ with_nats_container() do _container, url, port
                 err
             end
             @test err === flush_error_io.err
-            @test wait_ready(flush_error_conn.async_errors) === flush_error_io.err
+            @test wait_ready(flush_error_conn.async_errors).error === flush_error_io.err
             @test NATS.last_error(flush_error_conn) === flush_error_io.err
             @test NATS.stats(flush_error_conn).out_msgs == 0
             @test NATS.connection_status(flush_error_conn) == NATS.CONNECTED
@@ -6327,7 +6331,7 @@ with_nats_container() do _container, url, port
                 err
             end
             @test err === default_io.err
-            @test wait_ready(default_error_conn.async_errors) === default_io.err
+            @test wait_ready(default_error_conn.async_errors).error === default_io.err
             @test NATS.last_error(default_error_conn) === default_io.err
             @test NATS.connection_status(default_error_conn) == NATS.CONNECTED
             @test !default_io.closed
@@ -6341,7 +6345,7 @@ with_nats_container() do _container, url, port
         )
         try
             @test NATS.publish(background_error_conn, "natsjl.write-error.background", "data") === nothing
-            @test wait_ready(background_error_conn.async_errors) === background_error_io.err
+            @test wait_ready(background_error_conn.async_errors).error === background_error_io.err
             @test NATS.last_error(background_error_conn) === background_error_io.err
             @test NATS.stats(background_error_conn).out_msgs == 1
             @test NATS.connection_status(background_error_conn) == NATS.CONNECTED
@@ -6365,7 +6369,7 @@ with_nats_container() do _container, url, port
                 err
             end
             @test err === no_reconnect_io.err
-            @test wait_ready(no_reconnect_conn.async_errors) === no_reconnect_io.err
+            @test wait_ready(no_reconnect_conn.async_errors).error === no_reconnect_io.err
             @test NATS.last_error(no_reconnect_conn) === no_reconnect_io.err
             @test wait_ready(closed) == NATS.CLOSED
             @test NATS.connection_status(no_reconnect_conn) == NATS.CLOSED
@@ -6819,3 +6823,5 @@ end
 include("object_download.jl")
 include("watcher_cleanup.jl")
 with_nats(ObjectDownloadTests.runtests)
+
+include("trim_compile_tests.jl")

@@ -8,6 +8,66 @@ const DEFAULT_PING_INTERVAL = 120.0
 const DEFAULT_MAX_PINGS_OUT = 2
 const DEFAULT_WRITE_BUFFER_SIZE = 32 * 1024
 
+# How each kind of callback runs: a `Callback{K}` evaluates `K(f, args)`. These
+# check what the user's function returns and convert it to the one type its
+# caller expects.
+
+function user_info_callback_value(cb, @nospecialize(_args))
+    value = cb()
+    if value isa Pair
+        return String(value.first), String(value.second)
+    elseif value isa Tuple && length(value) == 2
+        return String(value[1]), String(value[2])
+    elseif value isa NamedTuple && haskey(value, :user) && haskey(value, :password)
+        return String(value.user), String(value.password)
+    end
+    throw(ArgumentError("user_info_cb must return a (user, password) tuple, pair, or named tuple"))
+end
+
+function token_callback_value(cb, @nospecialize(_args))
+    value = cb()
+    value isa AbstractString || throw(ArgumentError("token_cb must return an AbstractString"))
+    return String(value)
+end
+
+function websocket_headers_callback_value(cb, @nospecialize(_args))
+    headers = cb()
+    headers === nothing && return Pair{String,String}[]
+    return normalize_websocket_headers(headers)
+end
+
+function reconnect_delay_callback_value(cb, @nospecialize(args))
+    delay = cb((args::Tuple{Int})[1])
+    delay === nothing && return 0.0
+    delay_s = Float64(delay)
+    delay_s < 0 && throw(ArgumentError("custom reconnect delay must be nonnegative"))
+    return delay_s
+end
+
+function reconnect_to_server_callback_value(cb, @nospecialize(args))
+    servers, info = args::Tuple{Vector{String}, ServerInfo}
+    selected, delay = normalize_reconnect_to_server_result(cb(servers, info))
+    return reconnect_selection_url(selected), delay
+end
+
+call_connection_handler(cb, @nospecialize(args)) = (cb((args::Tuple{Connection})[1]); nothing)
+
+function call_connection_error_handler(cb, @nospecialize(args))
+    conn, err = args::Tuple{Connection, Any}
+    cb(conn, err)
+    return nothing
+end
+
+function call_error_handler(cb, @nospecialize(args))
+    conn, sub, err = args::Tuple{Connection, Union{Nothing, Subscription}, Any}
+    applicable(cb, conn, sub, err) ? cb(conn, sub, err) : cb(conn, err)
+    return nothing
+end
+
+call_subscription_closed_handler(cb, @nospecialize(args)) = (cb((args::Tuple{String})[1]); nothing)
+call_barrier_callback(cb, @nospecialize(_args)) = (cb(); nothing)
+call_subscription_cleanup(cb, @nospecialize(args)) = (cb((args::Tuple{Float64})[1]); nothing)
+
 Base.@kwdef mutable struct Options
     servers::Vector{String} = String[]
     no_randomize::Bool = false
@@ -19,17 +79,17 @@ Base.@kwdef mutable struct Options
     headers::Bool = true
     user::Union{Nothing, String} = nothing
     password::Union{Nothing, String} = nothing
-    user_info_cb::Union{Nothing, Function} = nothing
+    user_info_cb::Union{Nothing, Callback{user_info_callback_value}} = nothing
     token::Union{Nothing, String} = nothing
-    token_cb::Union{Nothing, Function} = nothing
+    token_cb::Union{Nothing, Callback{token_callback_value}} = nothing
     jwt::Union{Nothing, String} = nothing
-    jwt_cb::Union{Nothing, Function} = nothing
+    jwt_cb::Union{Nothing, Callback{jwt_callback_value}} = nothing
     nkey::Union{Nothing, String} = nothing
     nkey_seed::Union{Nothing, String} = nothing
     credentials::Union{Nothing, String} = nothing
     jwt_file::Union{Nothing, String} = nothing
     nkey_seed_file::Union{Nothing, String} = nothing
-    signature_cb::Union{Nothing, Function} = nothing
+    signature_cb::Union{Nothing, Callback{signature_callback_value}} = nothing
     tls_required::Bool = false
     tls_handshake_first::Bool = false
     tls::TLSOptions = TLSOptions()
@@ -43,8 +103,8 @@ Base.@kwdef mutable struct Options
     reconnect_wait::Float64 = 2.0
     reconnect_jitter::Float64 = 0.1
     reconnect_jitter_tls::Float64 = 1.0
-    custom_reconnect_delay_cb::Union{Nothing, Function} = nothing
-    reconnect_to_server_cb::Union{Nothing, Function} = nothing
+    custom_reconnect_delay_cb::Union{Nothing, Callback{reconnect_delay_callback_value}} = nothing
+    reconnect_to_server_cb::Union{Nothing, Callback{reconnect_to_server_callback_value}} = nothing
     reconnect_buffer_size::Int = 8 * 1024 * 1024
     write_buffer_size::Int = DEFAULT_WRITE_BUFFER_SIZE
     reconnect_on_flusher_error::Bool = false
@@ -58,16 +118,16 @@ Base.@kwdef mutable struct Options
     skip_subject_validation::Bool = false
     ignore_discovered_servers::Bool = false
     websocket_headers::Vector{Pair{String,String}} = Pair{String,String}[]
-    websocket_headers_cb::Union{Nothing, Function} = nothing
+    websocket_headers_cb::Union{Nothing, Callback{websocket_headers_callback_value}} = nothing
     proxy_path::Union{Nothing, String} = nothing
-    connected_cb::Union{Nothing, Function} = nothing
-    error_cb::Union{Nothing, Function} = nothing
-    reconnect_error_cb::Union{Nothing, Function} = nothing
-    discovered_servers_cb::Union{Nothing, Function} = nothing
-    lame_duck_cb::Union{Nothing, Function} = nothing
-    disconnected_cb::Union{Nothing, Function} = nothing
-    reconnected_cb::Union{Nothing, Function} = nothing
-    closed_cb::Union{Nothing, Function} = nothing
+    connected_cb::Union{Nothing, Callback{call_connection_handler}} = nothing
+    error_cb::Union{Nothing, Callback{call_error_handler}} = nothing
+    reconnect_error_cb::Union{Nothing, Callback{call_connection_error_handler}} = nothing
+    discovered_servers_cb::Union{Nothing, Callback{call_connection_handler}} = nothing
+    lame_duck_cb::Union{Nothing, Callback{call_connection_handler}} = nothing
+    disconnected_cb::Union{Nothing, Callback{call_connection_error_handler}} = nothing
+    reconnected_cb::Union{Nothing, Callback{call_connection_handler}} = nothing
+    closed_cb::Union{Nothing, Callback{call_connection_handler}} = nothing
 end
 
 mutable struct Subscription
@@ -82,11 +142,11 @@ mutable struct Subscription
     callback_subscription::Bool
     processing::Int
     closed::Bool
-    close_error::Union{Nothing, Exception}
+    close_error::Any # the exception that closed the subscription, or `nothing`
     server_sent::Bool
     status::SubscriptionStatus
     status_listeners::Dict{Channel{SubscriptionStatus}, Vector{SubscriptionStatus}}
-    closed_cb::Union{Nothing, Function}
+    closed_cb::Union{Nothing, Callback{call_subscription_closed_handler}}
     max_msgs::Union{Nothing, Int}
     delivered::Int
     dropped::Int
@@ -97,9 +157,26 @@ mutable struct Subscription
     pending_bytes_limit::Int
 end
 
+"""
+    AsyncError
+
+An error reported in the background, as delivered through `conn.async_errors`:
+`error` is the exception and `subscription` the subscription it concerns, or
+`nothing`.
+"""
+struct AsyncError
+    error::Any
+    subscription::Union{Nothing, Subscription}
+end
+
+# Sent to a pending publish acknowledgement when the connection abandons it.
+struct PubAckAbort
+    error::Any
+end
+
 mutable struct BarrierAction
     remaining::Int
-    callback::Union{Nothing, Function}
+    callback::Union{Nothing, Callback{call_barrier_callback}}
     lock::ReentrantLock
 end
 
@@ -117,7 +194,7 @@ mutable struct Connection
     explicit_server_keys::Set{Tuple{String,String,Int}}
     discovered_server_keys::Set{Tuple{String,String,Int}}
     options::Options
-    io::Any
+    io::Union{Nothing, Transport}
     info::ServerInfo
     in_msgs::UInt64
     out_msgs::UInt64
@@ -134,7 +211,7 @@ mutable struct Connection
     flusher_task::Union{Nothing, Task}
     subscriptions::Dict{Int, Subscription}
     next_sid::Int
-    rng::AbstractRNG
+    rng::Random.TaskLocalRNG
     reader_task::Union{Nothing, Task}
     reconnect_task::Union{Nothing, Task}
     ping_task::Union{Nothing, Task}
@@ -142,16 +219,16 @@ mutable struct Connection
     reconnect_timer::Union{Nothing, Timer}
     pongs::Channel{Nothing}
     pings_out::Int
-    async_errors::Channel{Any}
+    async_errors::Channel{AsyncError}
     last_error::Any
     last_auth_errors::Dict{Tuple{String,String,Int}, DataType}
     pending_frames::Vector{Vector{UInt8}}
     pending_bytes::Int
     request_sub::Union{Nothing, Subscription}
     request_prefix::Union{Nothing, String}
-    request_map::Dict{String, Channel}
+    request_map::Dict{String, Channel{Any}}
     pub_ack_tokens::Set{String}
-    subscription_cleanups::Dict{Int, Function}
+    subscription_cleanups::Dict{Int, Callback{call_subscription_cleanup}}
     connected_once::Bool
 end
 
@@ -159,102 +236,94 @@ function Base.show(io::IO, conn::Connection)
     print(io, "NATS.Connection(", url_without_auth(conn.url), ", ", conn.status, ", ", length(conn.subscriptions), " subscriptions)")
 end
 
-function safe_callback(conn::Connection, cb::Union{Nothing, Function}, args...)
+"""
+    monitored_task(f) -> Task
+
+Run `f()` on a new task that logs any error `f` throws and then fails with it,
+like `errormonitor(@async f())`. `errormonitor` prints to the untyped global
+`stderr`, which `juliac --trim` cannot compile; `@error` can. Executables that
+JuliaC builds with `--trim` turn logging off, so there a failed task is silent.
+"""
+function monitored_task(f::F) where {F}
+    return @async try
+        f()
+    catch err
+        @error "NATS background task failed" exception = (err, catch_backtrace())
+        rethrow()
+    end
+end
+
+# Runs `cb` with `args` on its own task; an error it throws goes to
+# `conn.async_errors`.
+function safe_callback(conn::Connection, cb::Union{Nothing, Callback}, @nospecialize(args::Tuple))
     cb === nothing && return nothing
-    @async begin
-        try
-            cb(args...)
-        catch err
-            put!(conn.async_errors, err)
-        end
+    @async try
+        invoke_callback(cb, args)
+    catch err
+        put!(conn.async_errors, AsyncError(err, nothing))
     end
     return nothing
 end
 
-function safe_error_callback(conn::Connection, cb::Union{Nothing, Function}, sub, err)
-    cb === nothing && return nothing
-    @async begin
-        try
-            if applicable(cb, conn, sub, err)
-                cb(conn, sub, err)
-            else
-                cb(conn, err)
-            end
-        catch callback_err
-            put!(conn.async_errors, callback_err)
-        end
-    end
-    return nothing
-end
-
-function notify_error!(conn::Connection, err, sub = nothing)
+# Errors reach here from `catch` blocks with unknown types, so the notification
+# helpers that take one do not specialize on it.
+function notify_error!(conn::Connection, @nospecialize(err), sub::Union{Nothing, Subscription} = nothing)
     set_last_error!(conn, err)
-    put!(conn.async_errors, err)
-    safe_error_callback(conn, conn.options.error_cb, sub, err)
+    put!(conn.async_errors, AsyncError(err, sub))
+    safe_callback(conn, conn.options.error_cb, (conn, sub, err))
     return nothing
 end
 
 function notify_connected!(conn::Connection)
-    safe_callback(conn, conn.options.connected_cb, conn)
+    safe_callback(conn, conn.options.connected_cb, (conn,))
     return nothing
 end
 
-function notify_reconnect_error!(conn::Connection, err)
+function notify_reconnect_error!(conn::Connection, @nospecialize(err))
     set_last_error!(conn, err)
-    safe_callback(conn, conn.options.reconnect_error_cb, conn, err)
+    safe_callback(conn, conn.options.reconnect_error_cb, (conn, err))
     return nothing
 end
 
 function notify_discovered_servers!(conn::Connection)
-    safe_callback(conn, conn.options.discovered_servers_cb, conn)
+    safe_callback(conn, conn.options.discovered_servers_cb, (conn,))
     return nothing
 end
 
 function notify_lame_duck!(conn::Connection)
-    safe_callback(conn, conn.options.lame_duck_cb, conn)
+    safe_callback(conn, conn.options.lame_duck_cb, (conn,))
     return nothing
 end
 
-function notify_disconnected!(conn::Connection, err)
+function notify_disconnected!(conn::Connection, @nospecialize(err))
     set_last_error!(conn, err)
-    safe_callback(conn, conn.options.disconnected_cb, conn, err)
+    safe_callback(conn, conn.options.disconnected_cb, (conn, err))
     return nothing
 end
 
 function notify_reconnected!(conn::Connection)
-    safe_callback(conn, conn.options.reconnected_cb, conn)
+    safe_callback(conn, conn.options.reconnected_cb, (conn,))
     return nothing
 end
 
 function notify_closed!(conn::Connection)
-    safe_callback(conn, conn.options.closed_cb, conn)
-    return nothing
-end
-
-function safe_subscription_callback(sub::Subscription, cb::Union{Nothing, Function}, args...)
-    cb === nothing && return nothing
-    @async begin
-        try
-            cb(args...)
-        catch err
-            put!(sub.connection.async_errors, err)
-        end
-    end
+    safe_callback(conn, conn.options.closed_cb, (conn,))
     return nothing
 end
 
 function notify_subscription_closed!(sub::Subscription)
-    safe_subscription_callback(sub, sub.closed_cb, sub.subject)
+    cb = sub.closed_cb
+    cb === nothing || safe_callback(sub.connection::Connection, cb, (sub.subject,))
     return nothing
 end
 
-function set_subscription_cleanup!(conn::Connection, sub::Subscription, cb::Union{Nothing, Function})
+function set_subscription_cleanup!(conn::Connection, sub::Subscription, cb::F) where {F}
     lock(conn.lock)
     try
         if cb === nothing
             delete!(conn.subscription_cleanups, sub.sid)
         else
-            conn.subscription_cleanups[sub.sid] = cb
+            conn.subscription_cleanups[sub.sid] = Callback{call_subscription_cleanup}(cb)
         end
     finally
         unlock(conn.lock)
@@ -280,10 +349,10 @@ function has_subscription_cleanups(conn::Connection)
     end
 end
 
-function run_subscription_cleanup(conn::Connection, cb, timeout::Real; throw_errors::Bool)
+function run_subscription_cleanup(conn::Connection, cb::Union{Nothing, Callback{call_subscription_cleanup}}, timeout::Real; throw_errors::Bool)
     cb === nothing && return nothing
     try
-        cb(timeout)
+        invoke_callback(cb, (Float64(timeout),))
     catch err
         notify_error!(conn, err)
         throw_errors && rethrow()
@@ -302,10 +371,10 @@ function take_all_subscription_cleanups_locked!(conn::Connection)
     return cleanups
 end
 
-function run_terminal_subscription_cleanups!(cleanups::Vector{Function})
+function run_terminal_subscription_cleanups!(cleanups::Vector{Callback{call_subscription_cleanup}})
     for cleanup in cleanups
         try
-            cleanup(0.0)
+            invoke_callback(cleanup, (0.0,))
         catch
         end
     end
@@ -351,13 +420,13 @@ function take_pending_frames!(conn::Connection)
     end
 end
 
-function abort_pub_ack_futures_locked!(conn::Connection, err)
+function abort_pub_ack_futures_locked!(conn::Connection, @nospecialize(err))
     for token in collect(conn.pub_ack_tokens)
         ch = get(conn.request_map, token, nothing)
         if ch !== nothing
             if isopen(ch)
                 try
-                    put!(ch, err)
+                    put!(ch, PubAckAbort(err))
                 catch
                 end
             end
@@ -369,7 +438,7 @@ function abort_pub_ack_futures_locked!(conn::Connection, err)
     return nothing
 end
 
-function abort_pub_ack_futures!(conn::Connection, err)
+function abort_pub_ack_futures!(conn::Connection, @nospecialize(err))
     lock(conn.lock)
     try
         abort_pub_ack_futures_locked!(conn, err)
@@ -388,7 +457,7 @@ function buffered(conn::Connection)
     end
 end
 
-function set_last_error!(conn::Connection, err)
+function set_last_error!(conn::Connection, @nospecialize(err))
     lock(conn.lock)
     try
         conn.last_error = err
@@ -481,28 +550,9 @@ function validate_queue_name(queue::Union{Nothing, AbstractString})
 end
 
 function websocket_connection_headers(options::Options)
-    options.websocket_headers_cb === nothing && return copy(options.websocket_headers)
-    headers = options.websocket_headers_cb()
-    headers === nothing && return Pair{String,String}[]
-    return normalize_websocket_headers(headers)
-end
-
-function user_info_callback_value(cb)
-    value = cb()
-    if value isa Pair
-        return String(value.first), String(value.second)
-    elseif value isa Tuple && length(value) == 2
-        return String(value[1]), String(value[2])
-    elseif value isa NamedTuple && haskey(value, :user) && haskey(value, :password)
-        return String(value.user), String(value.password)
-    end
-    throw(ArgumentError("user_info_cb must return a (user, password) tuple, pair, or named tuple"))
-end
-
-function token_callback_value(cb)
-    value = cb()
-    value isa AbstractString || throw(ArgumentError("token_cb must return an AbstractString"))
-    return String(value)
+    cb = options.websocket_headers_cb
+    cb === nothing && return copy(options.websocket_headers)
+    return invoke_callback(cb, ())::Vector{Pair{String,String}}
 end
 
 server_key(url::ServerURL) = (url.scheme, url.host, url.port)
@@ -513,7 +563,7 @@ server_error_is_auth_error(err) =
     err isa AuthenticationRevokedError ||
     err isa AccountAuthenticationExpiredError
 
-function record_auth_error!(conn::Connection, server::ServerURL, err)
+function record_auth_error!(conn::Connection, server::ServerURL, @nospecialize(err))
     (conn.options.ignore_auth_error_abort || !server_error_is_auth_error(err)) && return false
     key = server_key(server)
     marker = typeof(err)
@@ -553,13 +603,32 @@ function server_pool(url::ServerURL, options::Options)
         throw(UnsupportedTransportError("servers", "mixing WebSocket and non-WebSocket NATS URLs is not supported"))
     end
     if !options.no_randomize && length(deduped) > 1
-        first_server = first(deduped)
-        rest = deduped[2:end]
-        shuffle!(rest)
-        deduped = vcat(first_server, rest)
+        shuffle!(@view deduped[2:end])
     end
     return deduped
 end
+
+# The CONNECT protocol message. Unset (`nothing`) fields are left out.
+struct ConnectMessage
+    verbose::Bool
+    pedantic::Bool
+    tls_required::Bool
+    lang::String
+    version::String
+    protocol::Int
+    echo::Bool
+    no_responders::Bool
+    headers::Bool
+    name::Union{Nothing, String}
+    user::Union{Nothing, String}
+    pass::Union{Nothing, String}
+    auth_token::Union{Nothing, String}
+    jwt::Union{Nothing, String}
+    nkey::Union{Nothing, String}
+    sig::Union{Nothing, String}
+end
+
+JSON.omit_null(::Type{ConnectMessage}) = true
 
 function connect_payload(options::Options, url::ServerURL, info::ServerInfo, secure::Bool)
     token = options.token
@@ -569,36 +638,41 @@ function connect_payload(options::Options, url::ServerURL, info::ServerInfo, sec
         token = url.user
         user = nothing
     end
-    if options.token_cb !== nothing
+    token_cb = options.token_cb
+    if token_cb !== nothing
         token === nothing || throw(TokenAlreadySetError())
-        token = token_callback_value(options.token_cb)
+        token = invoke_callback(token_cb, ())::String
     end
-    if options.user_info_cb !== nothing && url.user === nothing && url.password === nothing
+    user_info_cb = options.user_info_cb
+    if user_info_cb !== nothing && url.user === nothing && url.password === nothing
         if user !== nothing || password !== nothing
             throw(UserInfoAlreadySetError())
         end
-        user, password = user_info_callback_value(options.user_info_cb)
+        user, password = invoke_callback(user_info_cb, ())::Tuple{String, String}
     end
     options.no_echo && info.proto < 1 && throw(NoEchoNotSupportedError())
     server_headers_supported = info.headers === true
     headers_supported = options.headers && server_headers_supported
-    data = Dict{String, Any}(
-        "verbose" => options.verbose,
-        "pedantic" => options.pedantic,
-        "tls_required" => secure,
-        "lang" => CLIENT_LANG,
-        "version" => CLIENT_VERSION,
-        "protocol" => 1,
-        "echo" => !options.no_echo,
-        "no_responders" => options.no_responders && headers_supported,
-        "headers" => headers_supported,
+    auth = nats_auth_signature(options, info)
+    message = ConnectMessage(
+        options.verbose,
+        options.pedantic,
+        secure,
+        CLIENT_LANG,
+        CLIENT_VERSION,
+        1,
+        !options.no_echo,
+        options.no_responders && headers_supported,
+        headers_supported,
+        options.name,
+        user,
+        password,
+        token,
+        auth === nothing ? nothing : auth.jwt,
+        auth === nothing ? nothing : auth.nkey,
+        auth === nothing ? nothing : auth.sig,
     )
-    options.name === nothing || (data["name"] = options.name)
-    user === nothing || (data["user"] = user)
-    password === nothing || (data["pass"] = password)
-    token === nothing || (data["auth_token"] = token)
-    add_auth_fields!(data, options, info)
-    return Vector{UInt8}(codeunits("CONNECT $(JSON.json(data))\r\n"))
+    return Vector{UInt8}(codeunits("CONNECT $(JSON.json(message))\r\n"))
 end
 
 function connection_status(conn::Connection)
@@ -740,56 +814,56 @@ function set_discovered_servers_handler!(conn::Connection, cb::Union{Nothing, Fu
     return conn
 end
 
-discovered_servers_handler(conn::Connection) = conn.options.discovered_servers_cb
+discovered_servers_handler(conn::Connection) = callback_function(conn.options.discovered_servers_cb)
 
 function set_connected_handler!(conn::Connection, cb::Union{Nothing, Function})
     conn.options.connected_cb = cb
     return conn
 end
 
-connected_handler(conn::Connection) = conn.options.connected_cb
+connected_handler(conn::Connection) = callback_function(conn.options.connected_cb)
 
 function set_error_handler!(conn::Connection, cb::Union{Nothing, Function})
     conn.options.error_cb = cb
     return conn
 end
 
-error_handler(conn::Connection) = conn.options.error_cb
+error_handler(conn::Connection) = callback_function(conn.options.error_cb)
 
 function set_reconnect_error_handler!(conn::Connection, cb::Union{Nothing, Function})
     conn.options.reconnect_error_cb = cb
     return conn
 end
 
-reconnect_error_handler(conn::Connection) = conn.options.reconnect_error_cb
+reconnect_error_handler(conn::Connection) = callback_function(conn.options.reconnect_error_cb)
 
 function set_lame_duck_handler!(conn::Connection, cb::Union{Nothing, Function})
     conn.options.lame_duck_cb = cb
     return conn
 end
 
-lame_duck_handler(conn::Connection) = conn.options.lame_duck_cb
+lame_duck_handler(conn::Connection) = callback_function(conn.options.lame_duck_cb)
 
 function set_disconnected_handler!(conn::Connection, cb::Union{Nothing, Function})
     conn.options.disconnected_cb = cb
     return conn
 end
 
-disconnected_handler(conn::Connection) = conn.options.disconnected_cb
+disconnected_handler(conn::Connection) = callback_function(conn.options.disconnected_cb)
 
 function set_reconnected_handler!(conn::Connection, cb::Union{Nothing, Function})
     conn.options.reconnected_cb = cb
     return conn
 end
 
-reconnected_handler(conn::Connection) = conn.options.reconnected_cb
+reconnected_handler(conn::Connection) = callback_function(conn.options.reconnected_cb)
 
 function set_closed_handler!(conn::Connection, cb::Union{Nothing, Function})
     conn.options.closed_cb = cb
     return conn
 end
 
-closed_handler(conn::Connection) = conn.options.closed_cb
+closed_handler(conn::Connection) = callback_function(conn.options.closed_cb)
 
 function connected_info(conn::Connection)
     lock(conn.lock)
@@ -918,11 +992,11 @@ end
 function flush_write_buffer_locked!(conn::Connection)
     isempty(conn.write_buffer) && return nothing
     data = take_write_buffer_locked!(conn)
-    write_frame(conn.io, data)
+    write_frame(conn.io::Transport, data)
     return nothing
 end
 
-function handle_background_write_error!(conn::Connection, err)
+function handle_background_write_error!(conn::Connection, @nospecialize(err))
     if connection_status(conn) == CONNECTED
         if conn.options.reconnect_on_flusher_error
             if conn.options.allow_reconnect
@@ -965,7 +1039,7 @@ end
 
 function kick_flusher_locked!(conn::Connection)
     if conn.flusher_task === nothing || istaskdone(conn.flusher_task::Task)
-        conn.flusher_task = errormonitor(@async flusher_loop(conn))
+        conn.flusher_task = monitored_task(() -> flusher_loop(conn))
     end
     isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
     return nothing
@@ -973,7 +1047,7 @@ end
 
 function queue_frame_locked!(conn::Connection, frame::Vector{UInt8})
     if conn.options.write_buffer_size == 0
-        write_frame(conn.io, frame)
+        write_frame(conn.io::Transport, frame)
         return nothing
     end
     append!(conn.write_buffer, frame)
@@ -995,7 +1069,7 @@ function flush_write_buffer!(conn::Connection)
     return nothing
 end
 
-function close_after_terminal_error!(conn::Connection, err; expected_io = nothing)
+function close_after_terminal_error!(conn::Connection, @nospecialize(err); expected_io = nothing)
     local io
     lock(conn.write_lock)
     try
@@ -1015,13 +1089,13 @@ function close_after_terminal_error!(conn::Connection, err; expected_io = nothin
         unlock(conn.write_lock)
     end
     isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
-    close_subscriptions!(conn; err)
-    try close(io) catch end
+    close_subscriptions!(conn, err)
+    close_transport(io)
     notify_closed!(conn)
     return nothing
 end
 
-close_after_write_error!(conn::Connection, err) = close_after_terminal_error!(conn, err)
+close_after_write_error!(conn::Connection, @nospecialize(err)) = close_after_terminal_error!(conn, err)
 
 function send_frame(conn::Connection, frame::Vector{UInt8}; timeout::Union{Nothing, Real} = nothing, operation::AbstractString = "write", allow_draining::Bool = false, buffer_on_reconnect::Bool = false)
     while true
@@ -1083,7 +1157,7 @@ server_error_should_reconnect(err) =
     err isa AuthenticationExpiredError ||
     err isa AccountAuthenticationExpiredError
 
-function handle_terminal_server_error!(conn::Connection, err; expected_io = nothing)
+function handle_terminal_server_error!(conn::Connection, @nospecialize(err); expected_io = nothing)
     if server_error_should_reconnect(err) && conn.options.allow_reconnect && connection_status(conn) == CONNECTED
         start_reconnect!(conn, err; expected_io)
     else
@@ -1110,23 +1184,34 @@ function route_subscription_permission_error!(conn::Connection, err::PermissionV
         [sub for sub in values(conn.subscriptions) if sub.subject == subject && sub.queue == queue && !sub.closed]
     end
     for sub in subs
-        close_subscription_local!(conn, sub; err)
+        close_subscription_local!(conn, sub, err)
     end
     return !isempty(subs)
 end
 
+# Opens a transport to `url` and completes the NATS handshake on it. Each kind
+# of transport gets its own `handshake` call, so the transport's concrete type
+# stays known until it is wrapped in a `Transport`.
 function establish_connection(url::ServerURL, options::Options)
-    io = is_websocket_scheme(url) ?
-         open_websocket_transport(
-             url,
-             options.tls;
-             connect_timeout = options.connect_timeout,
-             headers = websocket_connection_headers(options),
-             proxy_path = options.proxy_path,
-         ) :
-         options.tls_handshake_first ?
-         open_tls_transport(url, options.tls; connect_timeout = options.connect_timeout) :
-         open_tcp_transport(url; connect_timeout = options.connect_timeout)
+    if is_websocket_scheme(url)
+        io = open_websocket_transport(
+            url,
+            options.tls;
+            connect_timeout = options.connect_timeout,
+            headers = websocket_connection_headers(options),
+            proxy_path = options.proxy_path,
+        )
+        return handshake(io, url, options)
+    elseif options.tls_handshake_first
+        return handshake(open_tls_transport(url, options.tls; connect_timeout = options.connect_timeout), url, options)
+    else
+        return handshake(open_tcp_transport(url; connect_timeout = options.connect_timeout), url, options)
+    end
+end
+
+# Reads the server's INFO, upgrades a TCP connection to TLS when either side
+# requires it, and sends CONNECT. Returns the `Transport` and server info.
+function handshake(io, url::ServerURL, options::Options)
     try
         first = read_protocol_message(io)
         first isa ServerInfo || throw(ProtocolError("expected INFO as first server message"))
@@ -1137,6 +1222,7 @@ function establish_connection(url::ServerURL, options::Options)
         secure = options.tls_handshake_first || url.scheme == "wss"
         if !secure && (want_tls || server_requires_tls)
             server_tls_available || throw(UnsupportedTransportError(url.scheme, "client requires TLS but the server did not advertise TLS support"))
+            io isa Reseau.TCP.Conn || throw(UnsupportedTransportError(url.scheme, "server requires TLS, which needs a tls:// or wss:// URL here"))
             io = upgrade_to_tls(io, url, options.tls)
             secure = true
         end
@@ -1150,7 +1236,7 @@ function establish_connection(url::ServerURL, options::Options)
             msg isa Pong && break
             throw(ProtocolError("unexpected handshake message $(typeof(msg))"))
         end
-        return io, info
+        return Transport(io), info
     catch
         try close(io) catch end
         rethrow()
@@ -1274,8 +1360,8 @@ function first_successful_connection(servers::Vector{ServerURL}, options::Option
     last_error = nothing
     for server in servers
         try
-            io, info = establish_connection(server, options)
-            return server, io, info
+            transport, info = establish_connection(server, options)
+            return server, transport, info
         catch err
             last_error = err
         end
@@ -1325,16 +1411,16 @@ function new_connection(
         nothing,
         Channel{Nothing}(Inf),
         0,
-        Channel{Any}(Inf),
+        Channel{AsyncError}(Inf),
         nothing,
         Dict{Tuple{String,String,Int}, DataType}(),
         Vector{UInt8}[],
         0,
         nothing,
         nothing,
-        Dict{String, Channel}(),
+        Dict{String, Channel{Any}}(),
         Set{String}(),
-        Dict{Int, Function}(),
+        Dict{Int, Callback{call_subscription_cleanup}}(),
         connected_once,
     )
 end
@@ -1366,7 +1452,7 @@ function start_ping_loop!(conn::Connection)
         if conn.ping_task !== nothing && !istaskdone(conn.ping_task)
             return nothing
         end
-        conn.ping_task = errormonitor(@async ping_loop(conn))
+        conn.ping_task = monitored_task(() -> ping_loop(conn))
     finally
         unlock(conn.lock)
     end
@@ -1429,7 +1515,7 @@ function ping_loop(conn::Connection)
     end
 end
 
-function init_retrying_connection(servers::Vector{ServerURL}, options::Options, initial_error)
+function init_retrying_connection(servers::Vector{ServerURL}, options::Options, @nospecialize(initial_error))
     conn = new_connection(
         first(servers),
         servers,
@@ -1442,30 +1528,35 @@ function init_retrying_connection(servers::Vector{ServerURL}, options::Options, 
     notify_error!(conn, initial_error)
     notify_reconnect_error!(conn, initial_error)
     start_ping_loop!(conn)
-    conn.reconnect_task = errormonitor(@async reconnect_loop(conn, initial_error))
+    conn.reconnect_task = monitored_task(() -> reconnect_loop(conn, initial_error))
     return conn
 end
 
 function init_connection(url::ServerURL, options::Options)
     servers = server_pool(url, options)
-    server, io, info = try
+    server, transport, info = try
         first_successful_connection(servers, options)
     catch err
         options.retry_on_failed_connect || rethrow()
         return init_retrying_connection(servers, options, err)
     end
     try
-        conn = new_connection(server, servers, options, io, info, CONNECTING; connected_once = true)
+        conn = new_connection(server, servers, options, transport, info, CONNECTING; connected_once = true)
         apply_discovered_servers!(conn, server, info; notify = false)
         set_connection_status!(conn, CONNECTED)
-        conn.reader_task = errormonitor(@async reader_loop(conn, io))
+        start_reader!(conn, transport)
         start_ping_loop!(conn)
         notify_connected!(conn)
         return conn
     catch
-        try close(io) catch end
+        close_transport(transport)
         rethrow()
     end
+end
+
+function start_reader!(conn::Connection, transport::Transport)
+    conn.reader_task = monitored_task(() -> run_reader_loop(transport, conn))
+    return nothing
 end
 
 function connect(url::AbstractString = DEFAULT_URL; kwargs...)
@@ -1476,7 +1567,7 @@ end
 function close(conn::Connection)
     should_notify = false
     subs = Subscription[]
-    cleanups = Function[]
+    cleanups = Callback{call_subscription_cleanup}[]
     buffered = UInt8[]
     err = ConnectionClosedError("connection is closed")
     lock(conn.write_lock)
@@ -1504,23 +1595,23 @@ function close(conn::Connection)
         finally
             unlock(conn.lock)
         end
-        isempty(buffered) || try write_frame(conn.io, buffered) catch end
+        isempty(buffered) || try write_frame(conn.io::Transport, buffered) catch end
     finally
         unlock(conn.write_lock)
     end
     isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
     for sub in subs
-        close_subscription_local!(conn, sub; err)
+        close_subscription_local!(conn, sub, err)
     end
     run_terminal_subscription_cleanups!(cleanups)
-    try close(conn.io) catch end
+    close_transport(conn.io)
     should_notify && notify_closed!(conn)
     return nothing
 end
 
-function close_subscriptions!(conn::Connection; err::Exception = ConnectionClosedError("connection is closed"))
+function close_subscriptions!(conn::Connection, @nospecialize(err))
     subs = Subscription[]
-    cleanups = Function[]
+    cleanups = Callback{call_subscription_cleanup}[]
     lock(conn.lock)
     try
         subs = collect(values(conn.subscriptions))
@@ -1537,7 +1628,7 @@ function close_subscriptions!(conn::Connection; err::Exception = ConnectionClose
         unlock(conn.lock)
     end
     for sub in subs
-        close_subscription_local!(conn, sub; err)
+        close_subscription_local!(conn, sub, err)
     end
     run_terminal_subscription_cleanups!(cleanups)
     return nothing
@@ -1546,7 +1637,7 @@ end
 # A reader task serves one transport. Once reconnect or close retires it, that
 # reader must not reply, record PONGs, or change the connection state.
 is_current_transport(conn::Connection, io) =
-    conn.io === io && conn.status != CLOSED && conn.status != RECONNECTING
+    transport_io(conn.io) === io && conn.status != CLOSED && conn.status != RECONNECTING
 
 function reader_loop(conn::Connection, io)
     reader = io isa Union{Reseau.TCP.Conn, Reseau.TLS.Conn} ? ProtocolReader(io) : io
@@ -1583,14 +1674,14 @@ function force_reconnect(conn::Connection; timeout::Union{Nothing, Real} = conn.
     return nothing
 end
 
-function start_reconnect!(conn::Connection, err; expected_io = nothing)
+function start_reconnect!(conn::Connection, @nospecialize(err); expected_io = nothing)
     should_start = false
     local io
     lock(conn.write_lock)
     try
         lock(conn.lock)
         try
-            (expected_io === nothing || conn.io === expected_io) || return nothing
+            (expected_io === nothing || transport_io(conn.io) === expected_io) || return nothing
             if conn.status == CONNECTED || conn.status == CONNECTING
                 io = conn.io
                 set_connection_status_locked!(conn, RECONNECTING)
@@ -1620,8 +1711,8 @@ function start_reconnect!(conn::Connection, err; expected_io = nothing)
         take!(conn.pongs)
     end
     reset_pings_out!(conn)
-    try close(io) catch end
-    conn.reconnect_task = errormonitor(@async reconnect_loop(conn, err))
+    close_transport(io)
+    conn.reconnect_task = monitored_task(() -> reconnect_loop(conn, err))
     return nothing
 end
 
@@ -1646,13 +1737,8 @@ function reconnect_uses_tls_policy(options::Options, current::ServerURL, servers
 end
 
 function reconnect_delay_seconds(options::Options, current::ServerURL, servers::Vector{ServerURL}, whole_list_attempts::Integer, rng::AbstractRNG)
-    if options.custom_reconnect_delay_cb !== nothing
-        delay = options.custom_reconnect_delay_cb(whole_list_attempts)
-        delay === nothing && return 0.0
-        delay_s = Float64(delay)
-        delay_s < 0 && throw(ArgumentError("custom reconnect delay must be nonnegative"))
-        return delay_s
-    end
+    cb = options.custom_reconnect_delay_cb
+    cb === nothing || return invoke_callback(cb, (Int(whole_list_attempts),))::Float64
     wait = options.reconnect_wait
     jitter = reconnect_uses_tls_policy(options, current, servers) ? options.reconnect_jitter_tls : options.reconnect_jitter
     jitter > 0 && (wait += rand(rng) * jitter)
@@ -1710,8 +1796,7 @@ function reconnect_to_server_selection(conn::Connection, servers::Vector{ServerU
     end
     snapshot = [server.raw for server in servers]
     try
-        selected, delay = normalize_reconnect_to_server_result(cb(snapshot, info))
-        selected_url = reconnect_selection_url(selected)
+        selected_url, delay = invoke_callback(cb, (snapshot, info))::Tuple{Union{Nothing, ServerURL}, Float64}
         selected_url === nothing && return nothing, 0.0, false
         server = matching_pool_server(selected_url, servers)
         if server === nothing
@@ -1830,14 +1915,14 @@ function send_subscription_if_needed!(conn::Connection, sub::Subscription)
 end
 
 function schedule_subscription_send!(conn::Connection, sub::Subscription)
-    errormonitor(@async begin
+    monitored_task() do
         try
             wait_connected(conn; operation = "subscribe")
             send_subscription_if_needed!(conn, sub)
         catch err
             connection_status(conn) == CLOSED || notify_error!(conn, err)
         end
-    end)
+    end
     return nothing
 end
 
@@ -1855,7 +1940,7 @@ function resend_subscriptions(io, subs::Vector{Subscription})
     return nothing
 end
 
-function mark_reconnect_failed!(conn::Connection, attempts::Int, last_error)
+function mark_reconnect_failed!(conn::Connection, attempts::Int, @nospecialize(last_error))
     err = ReconnectFailedError(attempts, last_error)
     notify_error!(conn, err)
     lock(conn.lock)
@@ -1868,13 +1953,13 @@ function mark_reconnect_failed!(conn::Connection, attempts::Int, last_error)
         unlock(conn.lock)
     end
     isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
-    close_subscriptions!(conn; err)
-    try close(conn.io) catch end
+    close_subscriptions!(conn, err)
+    close_transport(conn.io)
     notify_closed!(conn)
     return nothing
 end
 
-function abort_reconnect_after_auth_error!(conn::Connection, err)
+function abort_reconnect_after_auth_error!(conn::Connection, @nospecialize(err))
     notify_error!(conn, err)
     lock(conn.lock)
     try
@@ -1886,16 +1971,19 @@ function abort_reconnect_after_auth_error!(conn::Connection, err)
         unlock(conn.lock)
     end
     isready(conn.flusher_signal) || put!(conn.flusher_signal, nothing)
-    close_subscriptions!(conn; err)
-    try close(conn.io) catch end
+    close_subscriptions!(conn, err)
+    close_transport(conn.io)
     notify_closed!(conn)
     return nothing
 end
 
 function reconnect_attempt!(conn::Connection, server::ServerURL)
-    io = nothing
+    transport, info = try
+        establish_connection(server, conn.options)
+    catch err
+        return false, err
+    end
     try
-        io, info = establish_connection(server, conn.options)
         subs = active_subscriptions(conn)
         first_connect = false
         lock(conn.write_lock)
@@ -1904,18 +1992,18 @@ function reconnect_attempt!(conn::Connection, server::ServerURL)
             try
                 conn.status == CLOSED && throw(ConnectionClosedError("connection is closed"))
                 conn.url = server
-                conn.io = io
+                conn.io = transport
                 conn.info = info
                 conn.pings_out = 0
             finally
                 unlock(conn.lock)
             end
             apply_discovered_servers!(conn, server, info; notify = true)
-            resend_subscriptions(io, subs)
+            resend_subscriptions(transport, subs)
             while true
                 pending = take_pending_frames!(conn)
                 for frame in pending
-                    write_frame(io, frame)
+                    write_frame(transport, frame)
                 end
                 lock(conn.lock)
                 try
@@ -1925,7 +2013,7 @@ function reconnect_attempt!(conn::Connection, server::ServerURL)
                         conn.connected_once = true
                         set_connection_status_locked!(conn, CONNECTED)
                         conn.reconnect_task = nothing
-                        conn.reader_task = errormonitor(@async reader_loop(conn, io))
+                        start_reader!(conn, transport)
                         break
                     end
                 finally
@@ -1939,12 +2027,12 @@ function reconnect_attempt!(conn::Connection, server::ServerURL)
         first_connect ? notify_connected!(conn) : notify_reconnected!(conn)
         return true, nothing
     catch err
-        io === nothing || try close(io) catch end
+        close_transport(transport)
         return false, err
     end
 end
 
-function record_reconnect_error!(conn::Connection, err)
+function record_reconnect_error!(conn::Connection, @nospecialize(err))
     notify_error!(conn, err)
     notify_reconnect_error!(conn, err)
     return nothing
@@ -1979,7 +2067,7 @@ function wait_reconnect_delay(conn::Connection, delay::Real)
     return connection_status(conn) != CLOSED
 end
 
-function reconnect_loop(conn::Connection, initial_error = nothing)
+function reconnect_loop(conn::Connection, @nospecialize(initial_error))
     attempts = 0
     whole_list_attempts = 0
     last_error = initial_error
@@ -2165,7 +2253,7 @@ end
 
 function maybe_close_after_max_delivery!(sub::Subscription, max_msgs::Union{Nothing, Int})
     max_msgs === nothing && return nothing
-    close_subscription_local!(sub.connection, sub; err = MaxMessagesError(max_msgs))
+    close_subscription_local!(sub.connection::Connection, sub, MaxMessagesError(max_msgs))
     return nothing
 end
 
@@ -2350,7 +2438,7 @@ function finish_barrier!(barrier::BarrierAction)
     finally
         unlock(barrier.lock)
     end
-    cb === nothing || cb()
+    cb === nothing || invoke_callback(cb, ())
     return nothing
 end
 
@@ -2398,14 +2486,14 @@ function ensure_request_mux(conn::Connection)
 
     prefix = new_inbox(conn)
     sub = subscribe(conn, "$prefix.*")
-    sub.task = errormonitor(@async begin
+    sub.task = monitored_task() do
         for item in sub.channel
             item isa Msg || continue
             msg = item::Msg
             mark_message_taken!(sub, msg)
             dispatch_request_reply(conn, prefix, msg)
         end
-    end)
+    end
     stored = false
     selected_prefix = prefix
     lock(conn.lock)
@@ -2494,7 +2582,7 @@ function subscribe(callback::Function, conn::Connection, subject::AbstractString
     finally
         unlock(sub.lock)
     end
-    sub.task = errormonitor(@async begin
+    sub.task = monitored_task() do
         for item in sub.channel
             if item isa BarrierAction
                 finish_barrier!(item)
@@ -2515,7 +2603,7 @@ function subscribe(callback::Function, conn::Connection, subject::AbstractString
                 mark_callback_message_finished!(sub, msg)
             end
         end
-    end)
+    end
     return sub
 end
 
@@ -2580,7 +2668,7 @@ end
 function closed_handler(sub::Subscription)
     lock(sub.lock)
     try
-        return sub.closed_cb
+        return callback_function(sub.closed_cb)
     finally
         unlock(sub.lock)
     end
@@ -2672,7 +2760,7 @@ function dropped(sub::Subscription)
     end
 end
 
-function close_subscription_local!(conn::Connection, sub::Subscription; err::Union{Nothing, Exception} = nothing)
+function close_subscription_local!(conn::Connection, sub::Subscription, @nospecialize(err = nothing))
     should_notify = false
     lock(conn.lock)
     try
@@ -2756,7 +2844,7 @@ function unsubscribe(
     send_frame(conn, frame, timeout = timeout, operation = "unsubscribe")
     if immediate
         close_err = max !== nothing && max > 0 ? MaxMessagesError(max) : nothing
-        close_subscription_local!(conn, sub; err = close_err)
+        close_subscription_local!(conn, sub, close_err)
         run_subscription_cleanup!(conn, sub, timeout; throw_errors = true)
     end
     return nothing
@@ -2971,11 +3059,18 @@ function check_request_response(msg::Msg, subject::AbstractString)
     return msg
 end
 
-function take_request_reply(ch::Channel{Msg}, timeout::Real)
+function take_request_reply(ch::Channel{Any}, timeout::Real)
     timed_out = Threads.Atomic{Bool}(false)
-    timer = Timer(Float64(timeout)) do _
+    timer = Timer(Float64(timeout))
+    # A firing timer closes the inbox; closing the timer first (below) ends
+    # this task early. A `Timer` callback would also work, but Base reports its
+    # errors through the untyped global `stderr`, which `juliac --trim` cannot
+    # compile.
+    @async try
+        wait(timer)
         timed_out[] = true
-        try close(ch) catch end
+        close(ch)
+    catch
     end
     try
         return take!(ch)
@@ -3026,7 +3121,7 @@ function request(conn::Connection, subject::AbstractString, data = nothing; time
     prefix = ensure_request_mux(conn)
     token = request_token(conn)
     inbox = "$prefix.$token"
-    ch = Channel{Msg}(1)
+    ch = Channel{Any}(1)
     lock(conn.lock)
     try
         conn.request_map[token] = ch
@@ -3062,10 +3157,8 @@ function drain(conn::Connection; timeout::Real = conn.options.drain_timeout)
             if status_before == CONNECTED
                 set_connection_status_locked!(conn, DRAINING)
                 request_mux = conn.request_sub
-                subs = [
-                    sub for sub in values(conn.subscriptions)
-                    if request_mux === nothing || sub !== request_mux
-                ]
+                subs = collect(values(conn.subscriptions))
+                request_mux === nothing || filter!(sub -> sub !== conn.request_sub, subs)
             end
         finally
             unlock(conn.lock)

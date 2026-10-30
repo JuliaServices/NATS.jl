@@ -63,17 +63,14 @@ end
 
 duration_ns(seconds::Real) = Int64(round(seconds * 1_000_000_000))
 
-mutable struct WebSocketTransport
-    ws::Any
-    client::Any
+mutable struct WebSocketTransport{W}
+    ws::W
     buffer::Vector{UInt8}
     position::Int
     closed::Bool
 end
 
-function WebSocketTransport(ws, client = nothing)
-    return WebSocketTransport(ws, client, UInt8[], 1, false)
-end
+WebSocketTransport(ws::W) where {W} = WebSocketTransport{W}(ws, UInt8[], 1, false)
 
 Base.isopen(io::WebSocketTransport) = !io.closed && !HTTP.WebSockets.isclosed(io.ws)
 
@@ -122,9 +119,12 @@ function Base.flush(::WebSocketTransport)
     return nothing
 end
 
+# Copying a default config inlines Reseau's keyword handling, so the optional
+# (`Union`-typed) settings below do not make the keyword call dynamic.
 function tls_config(url::ServerURL, tls::TLSOptions)
     server_name = something(tls.server_name, url.tls_server_name, url.host)
     return Reseau.TLS.Config(
+        Reseau.TLS.Config();
         server_name = server_name,
         verify_peer = tls.verify_peer,
         verify_hostname = tls.verify_hostname,
@@ -163,7 +163,6 @@ function open_tcp_transport(url::ServerURL; connect_timeout::Real)
 end
 
 function websocket_client(url::ServerURL, tls::TLSOptions; connect_timeout::Real)
-    url.scheme == "wss" || return nothing
     transport = HTTP.Transport(
         tls_config = tls_config(url, tls),
         max_idle_per_host = 1,
@@ -180,15 +179,21 @@ function open_websocket_transport(
         headers::Vector{Pair{String,String}} = Pair{String,String}[],
         proxy_path::Union{Nothing, AbstractString} = nothing,
 )
-    client = websocket_client(url, tls; connect_timeout)
-    ws = HTTP.WebSockets.open(
-        websocket_url(url; proxy_path);
-        headers,
-        connect_timeout,
-        client,
-        require_ssl_verification = true,
-    )
-    return WebSocketTransport(ws, client)
+    target = websocket_url(url; proxy_path)
+    # Separate calls keep each keyword set concretely typed; `wss` needs a client
+    # carrying the NATS TLS options.
+    ws = if url.scheme == "wss"
+        HTTP.WebSockets.open(
+            target;
+            headers,
+            connect_timeout,
+            client = websocket_client(url, tls; connect_timeout),
+            require_ssl_verification = true,
+        )
+    else
+        HTTP.WebSockets.open(target; headers, connect_timeout, require_ssl_verification = true)
+    end
+    return WebSocketTransport(ws)
 end
 
 function open_tls_transport(url::ServerURL, tls::TLSOptions; connect_timeout::Real)

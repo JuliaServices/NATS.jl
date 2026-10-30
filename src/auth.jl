@@ -215,10 +215,23 @@ end
 
 nkey_sign(seed::AbstractString, data::AbstractString) = nkey_sign(seed, Vector{UInt8}(codeunits(data)))
 
+const BASE64URL_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
 function base64url_no_padding(data::AbstractVector{UInt8})
-    encoded = base64encode(data)
-    encoded = replace(encoded, "+" => "-", "/" => "_")
-    return replace(encoded, r"=+$" => "")
+    out = UInt8[]
+    sizehint!(out, cld(4 * length(data), 3))
+    acc = UInt32(0)
+    bits = 0
+    for byte in data
+        acc = (acc << 8) | UInt32(byte)
+        bits += 8
+        while bits >= 6
+            bits -= 6
+            push!(out, codeunit(BASE64URL_ALPHABET, Int((acc >> bits) & 0x3f) + 1))
+        end
+    end
+    bits > 0 && push!(out, codeunit(BASE64URL_ALPHABET, Int((acc << (6 - bits)) & 0x3f) + 1))
+    return String(out)
 end
 
 function signature_bytes(signature)
@@ -264,11 +277,14 @@ function set_auth_value(current, value, name::AbstractString)
     throw(ArgumentError("multiple $name values were provided"))
 end
 
-function jwt_callback_value(cb)
+# `Callback` kinds for `jwt_cb` and `signature_cb`; see `Callback`.
+function jwt_callback_value(cb, @nospecialize(_args))
     value = cb()
     value isa AbstractString || throw(ArgumentError("jwt_cb must return an AbstractString"))
     return String(value)
 end
+
+signature_callback_value(cb, @nospecialize(args)) = signature_bytes(cb((args::Tuple{String})[1]))
 
 function auth_material(options)
     jwt = options.jwt
@@ -276,8 +292,9 @@ function auth_material(options)
     nkey_seed = options.nkey_seed
     signature_cb = options.signature_cb
 
-    if options.jwt_cb !== nothing
-        jwt = set_auth_value(jwt, jwt_callback_value(options.jwt_cb), "jwt")
+    jwt_cb = options.jwt_cb
+    if jwt_cb !== nothing
+        jwt = set_auth_value(jwt, invoke_callback(jwt_cb, ())::String, "jwt")
     end
 
     if options.credentials !== nothing
@@ -326,15 +343,7 @@ function nats_auth_signature(options, info)
     if has_nkey
         nkey_decode_public_key(auth.nkey)
     end
-    raw_signature = signature_bytes(auth.signature_cb(nonce))
+    signer = auth.signature_cb::Callback{signature_callback_value}
+    raw_signature = invoke_callback(signer, (String(nonce),))::Vector{UInt8}
     return (jwt = auth.jwt, nkey = auth.nkey, sig = base64url_no_padding(raw_signature))
-end
-
-function add_auth_fields!(data::Dict{String, Any}, options, info)
-    auth = nats_auth_signature(options, info)
-    auth === nothing && return data
-    auth.jwt === nothing || (data["jwt"] = auth.jwt)
-    auth.nkey === nothing || (data["nkey"] = auth.nkey)
-    data["sig"] = auth.sig
-    return data
 end
