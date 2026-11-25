@@ -1224,7 +1224,14 @@ include("protocol_reader.jl")
     for bad_header_block in ("", "BAD/1.0\r\n\r\n", "NATS/1.0", "NATS/1.0\r\n", "NATS/1.0\r\nk1:v1", "NATS/1.0\r\nk1:v1\r\n", "NATS/1.0\r\nnot-a-header\r\n\r\n")
         @test_throws NATS.ProtocolError NATS.parse_header_block(Vector{UInt8}(codeunits(bad_header_block)))
     end
-    @test_throws NATS.InvalidHeaderKeyError NATS.parse_header_block(Vector{UInt8}(codeunits("NATS/1.0\r\nbad key: value\r\n\r\n")))
+    # Received keys are taken as sent (only publishing validates them); empty keys are skipped.
+    received_headers, _, _ = NATS.parse_header_block(Vector{UInt8}(codeunits("NATS/1.0\r\nbad key: value\r\n: skipped\r\nÜnits: m\r\n\r\n")))
+    @test received_headers == ["bad key" => "value", "Ünits" => "m"]
+    @test NATS.message_header_bytes(NATS.Msg("s", 1, nothing, received_headers, UInt8[], 200, "")) ==
+        ncodeunits("NATS/1.0\r\nbad key: value\r\nÜnits: m\r\n\r\n")
+    for hs in (Pair{String,String}[], ["X-Test" => "one"], ["A" => "line1\nline2", "B" => "→"])
+        @test NATS.headers_size(hs) == length(NATS.headers_bytes(hs))
+    end
     malformed_hmsg = IOBuffer(Vector{UInt8}(codeunits("NATS/1.0\r\nk1:v1payload\r\n")))
     @test_throws NATS.ProtocolError NATS.parse_msg_line("HMSG foo 1 15 22", malformed_hmsg, true)
     @test_throws NATS.ProtocolError NATS.parse_msg_line("MSG foo 1 3 3 extra", IOBuffer(Vector{UInt8}(codeunits("abc\r\n"))), false)
@@ -5949,6 +5956,48 @@ with_ws_nats() do url
         finally
             NATS.close(conn)
         end
+    end
+end
+
+@testset "a received header key outside the token set keeps the connection" begin
+    listener = listen(ip"127.0.0.1", 0)
+    port = Int(last(getsockname(listener)))
+    server_task = errormonitor(@async begin
+        sock = accept(listener)
+        try
+            write_mock_info(sock, port)
+            read_mock_connect_ping(sock)
+            line = NATS.readline_crlf(sock)
+            while !startswith(line, "SUB ")
+                line = NATS.readline_crlf(sock)
+            end
+            sid = split(line)[end]
+            hdr = "NATS/1.0\r\nbad key: v\r\n\r\n"
+            write(sock, "HMSG odd.headers $sid $(ncodeunits(hdr)) $(ncodeunits(hdr) + 5)\r\n$(hdr)first\r\n")
+            write(sock, "MSG odd.headers $sid 6\r\nsecond\r\n")
+            flush(sock)
+            while true
+                NATS.readline_crlf(sock) == "PING" && (write(sock, "PONG\r\n"); flush(sock))
+            end
+        catch err
+            err isa EOFError || err isa Base.IOError || rethrow()
+        finally
+            close(sock)
+        end
+    end)
+    conn = NATS.connect("nats://127.0.0.1:$port"; allow_reconnect = false)
+    try
+        sub = NATS.subscribe(conn, "odd.headers")
+        first_msg = NATS.next_msg(sub; timeout = 5)
+        @test NATS.payload(first_msg) == "first"
+        @test first_msg.headers == ["bad key" => "v"]
+        @test NATS.payload(NATS.next_msg(sub; timeout = 5)) == "second"
+        @test conn.status == NATS.CONNECTED
+        @test NATS.stats(conn).reconnects == 0
+    finally
+        NATS.close(conn)
+        close(listener)
+        timedwait(() -> istaskdone(server_task), 2; pollint = 0.001)
     end
 end
 

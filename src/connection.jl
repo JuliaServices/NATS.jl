@@ -2168,7 +2168,7 @@ function handle_protocol_message(conn::Connection, ::Pong, io)
 end
 
 message_pending_bytes(msg::Msg) = length(msg.data)
-message_header_bytes(msg::Msg) = isempty(msg.headers) && msg.status == 200 ? 0 : length(headers_bytes(msg.headers))
+message_header_bytes(msg::Msg) = headers_size(msg.headers)
 message_wire_bytes(msg::Msg) = length(msg.data) + message_header_bytes(msg)
 
 function account_received_message!(conn::Connection, msg::Msg)

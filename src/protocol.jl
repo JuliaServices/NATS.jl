@@ -179,7 +179,9 @@ function parse_header_block(bytes::Vector{UInt8})
         i = findfirst(':', line)
         i === nothing && throw(ProtocolError("bad header block"))
         key = strip(line[1:prevind(line, i)])
-        validate_header_key(key)
+        # Like nats.go, take keys as sent: only publishing restricts them to tokens,
+        # and one message from a less strict publisher must not end the connection.
+        isempty(key) && continue
         push!(headers, String(key) => strip(line[nextind(line, i):end]))
     end
     return headers, status, description
@@ -274,6 +276,16 @@ function validate_header_key(key::AbstractString)
 end
 
 sanitize_header_value(value::AbstractString) = replace(String(value), '\r' => ' ', '\n' => ' ')
+
+# The size of the block `headers_bytes` writes for `headers`, without building it.
+function headers_size(headers::Vector{Pair{String, String}})
+    isempty(headers) && return 0
+    n = ncodeunits("NATS/1.0\r\n") + 2
+    for (k, v) in headers
+        n += ncodeunits(k) + ncodeunits(": ") + ncodeunits(v) + 2
+    end
+    return n
+end
 
 function headers_bytes(headers::Vector{Pair{String, String}})
     isempty(headers) && return EMPTY_U8
